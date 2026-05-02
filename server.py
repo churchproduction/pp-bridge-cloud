@@ -1,7 +1,7 @@
-"""ProPresenter Bridge — Production Cloud Server."""
-import json, os, time, uuid, threading, sqlite3, logging, re, unicodedata
+"""ProPresenter Bridge — Production Cloud Server (with PowerPoint conversion)."""
+import json, os, time, uuid, threading, sqlite3, logging, re, unicodedata, subprocess, shutil, tempfile, glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 PORT       = int(os.environ.get("PORT", "8787"))
 DB_PATH    = os.environ.get("DB_PATH", "/tmp/ppbridge.db")
@@ -21,6 +21,42 @@ def sanitize_filename(name):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
     name = name.strip(". ")
     return name or "file"
+
+
+def convert_pptx_to_pngs(pptx_path, output_dir):
+    """Convert a .pptx to a list of PNGs using LibreOffice + pdftoppm.
+    Returns list of PNG filenames (basenames only) saved to output_dir,
+    sorted in slide order."""
+    workdir = tempfile.mkdtemp(prefix="ppconv-")
+    try:
+        log.info(f"Converting {pptx_path} via LibreOffice...")
+        result = subprocess.run([
+            "libreoffice", "--headless", "--convert-to", "pdf",
+            "--outdir", workdir, pptx_path
+        ], capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            log.error(f"LibreOffice failed: {result.stderr[:500]}")
+            raise RuntimeError(f"LibreOffice conversion failed: {result.stderr[:300]}")
+        # Find the generated PDF
+        pdfs = glob.glob(os.path.join(workdir, "*.pdf"))
+        if not pdfs:
+            raise RuntimeError("LibreOffice produced no PDF")
+        pdf_path = pdfs[0]
+        log.info(f"Got PDF: {pdf_path}, rendering pages...")
+        # Convert PDF to PNGs at 1920px wide using pdftoppm
+        base = os.path.join(output_dir, "slide")
+        result = subprocess.run([
+            "pdftoppm", "-png", "-scale-to-x", "1920", "-scale-to-y", "-1",
+            pdf_path, base
+        ], capture_output=True, text=True, timeout=180)
+        if result.returncode != 0:
+            log.error(f"pdftoppm failed: {result.stderr[:500]}")
+            raise RuntimeError(f"PDF render failed: {result.stderr[:300]}")
+        pngs = sorted([os.path.basename(p) for p in glob.glob(os.path.join(output_dir, "slide*.png"))])
+        log.info(f"Produced {len(pngs)} PNG slides")
+        return pngs
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 db_lock = threading.Lock()
@@ -137,7 +173,6 @@ class H(BaseHTTPRequestHandler):
             parts = u.path.split("/")
             if len(parts) < 6: return self._send_json(400, {"error": "bad path"})
             jid, fname = parts[-2], parts[-1]
-            from urllib.parse import unquote
             fname = unquote(fname)
             path = os.path.join(UPLOAD_DIR, jid, fname)
             if not os.path.exists(path): return self._send_json(404, {"error": "not found"})
@@ -207,14 +242,14 @@ button:disabled{opacity:.5}
 .err{background:rgba(248,113,113,.1);color:#f87171;border:1px solid rgba(248,113,113,.3)}
 </style>
 <h1>Upload to ProPresenter</h1>
-<div class=sub>Submits to the Ministries playlist on the chosen machine.</div>
+<div class=sub>Submits to the Ministries playlist. Images, videos, or .pptx all work.</div>
 <form id=f>
 <label>Presentation name</label>
 <input name=name placeholder="Sunday Announcements" required>
 <label>Send to</label>
 <select name=machine_id required id=machineSelect></select>
-<label>Files (images / videos)</label>
-<input type=file name=files multiple required accept="image/*,video/*">
+<label>Files (images / videos / .pptx)</label>
+<input type=file name=files multiple required accept="image/*,video/*,.pptx">
 <button type=submit id=submitBtn>Submit</button>
 </form>
 <div id=status class=status></div>
@@ -294,6 +329,8 @@ f.addEventListener('submit', async e => {
         jdir = os.path.join(UPLOAD_DIR, jid)
         os.makedirs(jdir, exist_ok=True)
         saved = []
+        # First pass: save all files (and remember which are .pptx)
+        pptx_paths = []
         for fname, data in files:
             safe = sanitize_filename(os.path.basename(fname))
             base, ext = os.path.splitext(safe)
@@ -301,9 +338,26 @@ f.addEventListener('submit', async e => {
             while os.path.exists(os.path.join(jdir, final)):
                 final = f"{base}-{n}{ext}"
                 n += 1
-            with open(os.path.join(jdir, final), "wb") as f:
+            full = os.path.join(jdir, final)
+            with open(full, "wb") as f:
                 f.write(data)
-            saved.append(final)
+            if final.lower().endswith(".pptx"):
+                pptx_paths.append(full)
+            else:
+                saved.append(final)
+        # Second pass: convert any .pptx to PNG slides
+        for pptx in pptx_paths:
+            try:
+                pngs = convert_pptx_to_pngs(pptx, jdir)
+                saved.extend(pngs)
+                # Delete the .pptx itself — agent doesn't need it
+                try: os.remove(pptx)
+                except Exception: pass
+            except Exception as e:
+                log.error(f"PPTX conversion failed for {pptx}: {e}")
+                return self._send_json(500, {"error": f"PPTX conversion failed: {e}"})
+        if not saved:
+            return self._send_json(400, {"error": "no usable files after processing"})
         ts = now()
         with db_lock, db() as c:
             if not c.execute("SELECT 1 FROM agents WHERE machine_id=?", (machine_id,)).fetchone():
