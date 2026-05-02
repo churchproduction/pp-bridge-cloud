@@ -1,4 +1,3 @@
-===
 """ProPresenter Bridge — Production Cloud Server."""
 import json, os, time, uuid, threading, sqlite3, logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -204,4 +203,3 @@ if __name__ == "__main__":
     log.info(f"DB: {DB_PATH}")
     log.info(f"Uploads: {UPLOAD_DIR}")
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
-===
