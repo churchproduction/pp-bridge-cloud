@@ -175,7 +175,7 @@ class H(BaseHTTPRequestHandler):
                 ])
         except Exception:
             pass
-        html = """<!doctype html><meta charset=utf-8><title>Upload</title>
+        html = r"""<!doctype html><meta charset=utf-8><title>Upload</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box}
