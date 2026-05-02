@@ -1,5 +1,14 @@
 """ProPresenter Bridge — Production Cloud Server."""
 import json, os, time, uuid, threading, sqlite3, logging
+import re, unicodedata
+def sanitize_filename(name):
+    # ASCII-fold unicode (strips narrow space \u202f, smart quotes, emojis, etc.)
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    # Strip any remaining unsafe path chars
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
+    name = name.strip(". ")
+    return name or "file"
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -276,8 +285,13 @@ f.addEventListener('submit', async e => {
         jdir = os.path.join(UPLOAD_DIR, jid); os.makedirs(jdir, exist_ok=True)
         saved = []
         for fname, data in files:
-            with open(os.path.join(jdir, os.path.basename(fname)), "wb") as f: f.write(data)
-            saved.append(os.path.basename(fname))
+            safe = sanitize_filename(os.path.basename(fname))
+            base, ext = os.path.splitext(safe)
+            n, final = 1, safe
+            while os.path.exists(os.path.join(jdir, final)):
+                final = f"{base}-{n}{ext}"; n += 1
+            with open(os.path.join(jdir, final), "wb") as f: f.write(data)
+            saved.append(final)
         ts = now()
         with db_lock, db() as c:
             if not c.execute("SELECT 1 FROM agents WHERE machine_id=?", (machine_id,)).fetchone():
