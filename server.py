@@ -1,14 +1,5 @@
 """ProPresenter Bridge — Production Cloud Server."""
-import json, os, time, uuid, threading, sqlite3, logging
-import re, unicodedata
-def sanitize_filename(name):
-    # ASCII-fold unicode (strips narrow space \u202f, smart quotes, emojis, etc.)
-    name = unicodedata.normalize("NFKD", name)
-    name = name.encode("ascii", "ignore").decode("ascii")
-    # Strip any remaining unsafe path chars
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
-    name = name.strip(". ")
-    return name or "file"
+import json, os, time, uuid, threading, sqlite3, logging, re, unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -21,6 +12,16 @@ MAX_UPLOAD = 200 * 1024 * 1024
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger("cloud")
+
+
+def sanitize_filename(name):
+    """Strip unicode oddities (narrow space, smart quotes, emoji), unsafe chars."""
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
+    name = name.strip(". ")
+    return name or "file"
+
 
 db_lock = threading.Lock()
 
@@ -55,6 +56,7 @@ init_db()
 
 def now(): return time.time()
 def is_online_row(r): return r and (now() - r["last_seen"]) < HEARTBEAT_TIMEOUT
+
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -135,6 +137,8 @@ class H(BaseHTTPRequestHandler):
             parts = u.path.split("/")
             if len(parts) < 6: return self._send_json(400, {"error": "bad path"})
             jid, fname = parts[-2], parts[-1]
+            from urllib.parse import unquote
+            fname = unquote(fname)
             path = os.path.join(UPLOAD_DIR, jid, fname)
             if not os.path.exists(path): return self._send_json(404, {"error": "not found"})
             with open(path, "rb") as f: data = f.read()
@@ -169,7 +173,8 @@ class H(BaseHTTPRequestHandler):
                 c.commit()
             log.info(f"  -> Job {jid[:8]} {'done' if ok else 'failed'}: {msg}")
             return self._send_json(200, {"ok": True})
-        if u.path == "/api/jobs": return self._submit_job()
+        if u.path == "/api/jobs":
+            return self._submit_job()
         return self._send_json(404, {"error": "not found"})
 
     def _upload_form(self):
@@ -264,7 +269,8 @@ f.addEventListener('submit', async e => {
         boundary = ctype.split("boundary=", 1)[1].encode()
         raw = self.rfile.read(length)
         parts = raw.split(b"--" + boundary)
-        machine_id = name = None; files = []
+        machine_id = name = None
+        files = []
         for p in parts:
             p = p.strip(b"\r\n")
             if not p or p == b"--" or b"\r\n\r\n" not in p: continue
@@ -276,21 +282,27 @@ f.addEventListener('submit', async e => {
             fields = dict(s.strip().split("=", 1) for s in disp[0].split(";")[1:] if "=" in s)
             field_name = fields.get("name", "").strip('"')
             filename = fields.get("filename", "").strip('"') if "filename" in fields else None
-            if filename: files.append((filename, content))
-            elif field_name == "machine_id": machine_id = content.decode()
-            elif field_name == "name": name = content.decode()
+            if filename:
+                files.append((filename, content))
+            elif field_name == "machine_id":
+                machine_id = content.decode()
+            elif field_name == "name":
+                name = content.decode()
         if not machine_id or not name or not files:
             return self._send_json(400, {"error": "need machine_id, name, files"})
         jid = str(uuid.uuid4())
-        jdir = os.path.join(UPLOAD_DIR, jid); os.makedirs(jdir, exist_ok=True)
+        jdir = os.path.join(UPLOAD_DIR, jid)
+        os.makedirs(jdir, exist_ok=True)
         saved = []
         for fname, data in files:
             safe = sanitize_filename(os.path.basename(fname))
             base, ext = os.path.splitext(safe)
             n, final = 1, safe
             while os.path.exists(os.path.join(jdir, final)):
-                final = f"{base}-{n}{ext}"; n += 1
-            with open(os.path.join(jdir, final), "wb") as f: f.write(data)
+                final = f"{base}-{n}{ext}"
+                n += 1
+            with open(os.path.join(jdir, final), "wb") as f:
+                f.write(data)
             saved.append(final)
         ts = now()
         with db_lock, db() as c:
@@ -303,6 +315,7 @@ f.addEventListener('submit', async e => {
             c.commit()
         log.info(f"  -> Job {jid[:8]} queued for {machine_id}: '{name}' ({len(saved)} files)")
         return self._send_json(200, {"job_id": jid, "status": "queued"})
+
 
 if __name__ == "__main__":
     log.info(f"PP Bridge cloud listening on :{PORT}")
