@@ -71,6 +71,13 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
 
+    def _send_html(self, code, html):
+        body = html.encode()
+        self.send_response(code); self._cors()
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+
     def _read_json(self):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n).decode()) if n else {}
@@ -82,6 +89,8 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/":
             return self._send_text(200, "PP Bridge cloud — alive")
+        if u.path == "/upload":
+            return self._upload_form()
         if u.path == "/api/status":
             with db_lock, db() as c:
                 rows = c.execute("SELECT * FROM agents").fetchall()
@@ -153,6 +162,89 @@ class H(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True})
         if u.path == "/api/jobs": return self._submit_job()
         return self._send_json(404, {"error": "not found"})
+
+    def _upload_form(self):
+        agents_json = "[]"
+        try:
+            with db_lock, db() as c:
+                rows = c.execute("SELECT machine_id, name, last_seen FROM agents").fetchall()
+                agents_json = json.dumps([
+                    {"id": r["machine_id"], "name": r["name"],
+                     "online": is_online_row(r)}
+                    for r in rows
+                ])
+        except Exception:
+            pass
+        html = """<!doctype html><meta charset=utf-8><title>Upload</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}
+body{font:16px/1.5 -apple-system,system-ui,sans-serif;background:#0f0d0a;color:#f4f4f0;padding:24px;max-width:520px;margin:0 auto;min-height:100vh}
+h1{font-weight:300;font-size:32px;margin:8px 0 4px}
+.sub{color:#8f8d86;font-size:14px;margin-bottom:32px}
+label{display:block;color:#8f8d86;font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin-top:20px;margin-bottom:6px}
+input,select,button{font:inherit;background:#15120e;color:#f4f4f0;border:1px solid #2a2620;border-radius:8px;padding:14px;width:100%}
+input[type=file]{padding:12px}
+button{background:#dcc78a;color:#0f0d0a;border:0;font-weight:500;padding:16px;margin-top:28px;cursor:pointer;font-size:16px}
+button:disabled{opacity:.5}
+.status{margin-top:24px;padding:14px;border-radius:8px;display:none}
+.status.show{display:block}
+.ok{background:rgba(134,239,172,.1);color:#86efac;border:1px solid rgba(134,239,172,.3)}
+.err{background:rgba(248,113,113,.1);color:#f87171;border:1px solid rgba(248,113,113,.3)}
+</style>
+<h1>Upload to ProPresenter</h1>
+<div class=sub>Submits to the Ministries playlist on the chosen machine.</div>
+<form id=f>
+<label>Presentation name</label>
+<input name=name placeholder="Sunday Announcements" required>
+<label>Send to</label>
+<select name=machine_id required id=machineSelect></select>
+<label>Files (images / videos)</label>
+<input type=file name=files multiple required accept="image/*,video/*">
+<button type=submit id=submitBtn>Submit</button>
+</form>
+<div id=status class=status></div>
+<script>
+const agents = __AGENTS__;
+const sel = document.getElementById('machineSelect');
+agents.forEach(a => {
+  const o = document.createElement('option');
+  o.value = a.id;
+  o.textContent = (a.online ? '\u{1F7E2} ' : '\u26AA ') + a.name + (a.online ? '' : ' (offline -- will queue)');
+  sel.appendChild(o);
+});
+if (!agents.length) {
+  const o = document.createElement('option');
+  o.disabled = true; o.textContent = 'No machines registered';
+  sel.appendChild(o);
+}
+const f = document.getElementById('f'), btn = document.getElementById('submitBtn'), st = document.getElementById('status');
+f.addEventListener('submit', async e => {
+  e.preventDefault();
+  btn.disabled = true; btn.textContent = 'Submitting...';
+  st.className = 'status'; st.textContent = '';
+  const fd = new FormData(f);
+  try {
+    const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (r.ok) {
+      st.className = 'status show ok';
+      st.textContent = "Submitted. Job " + j.job_id.slice(0,8) + " -- watch ProPresenter.";
+      f.reset();
+    } else {
+      st.className = 'status show err';
+      st.textContent = 'Error: ' + (j.error || 'unknown');
+    }
+  } catch (err) {
+    st.className = 'status show err';
+    st.textContent = 'Network error: ' + err;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Submit';
+  }
+});
+</script>"""
+        html = html.replace("__AGENTS__", agents_json)
+        return self._send_html(200, html)
 
     def _submit_job(self):
         ctype = self.headers.get("Content-Type", "")
