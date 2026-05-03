@@ -22,9 +22,7 @@ def sanitize_filename(name):
     return name or "file"
 
 def convert_pptx_to_pngs(pptx_path, output_dir):
-    """Convert a .pptx to a list of PNGs using LibreOffice + pdftoppm.
-    Returns list of PNG filenames (basenames only) saved to output_dir,
-    sorted in slide order."""
+    """Convert a .pptx to a list of PNGs using LibreOffice + pdftoppm."""
     workdir = tempfile.mkdtemp(prefix="ppconv-")
     try:
         log.info(f"Converting {pptx_path} via LibreOffice...")
@@ -35,13 +33,11 @@ def convert_pptx_to_pngs(pptx_path, output_dir):
         if result.returncode != 0:
             log.error(f"LibreOffice failed: {result.stderr[:500]}")
             raise RuntimeError(f"LibreOffice conversion failed: {result.stderr[:300]}")
-        # Find the generated PDF
         pdfs = glob.glob(os.path.join(workdir, "*.pdf"))
         if not pdfs:
             raise RuntimeError("LibreOffice produced no PDF")
         pdf_path = pdfs[0]
         log.info(f"Got PDF: {pdf_path}, rendering pages...")
-        # Convert PDF to PNGs at 1920px wide using pdftoppm
         base = os.path.join(output_dir, "slide")
         result = subprocess.run([
             "pdftoppm", "-png", "-scale-to-x", "1920", "-scale-to-y", "-1",
@@ -80,18 +76,21 @@ def init_db():
                 status TEXT NOT NULL,
                 folder TEXT NOT NULL,
                 files_json TEXT NOT NULL,
+                library_adds_json TEXT NOT NULL DEFAULT '[]',
                 result TEXT DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_machine_status ON jobs(machine_id, status);
         """)
-        # Defensive: add presentations column if upgrading an existing DB
-        # (no-op when /tmp wiped by Render redeploy, but harmless and future-proof).
-        try:
-            c.execute("ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        for ddl in [
+            "ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE jobs ADD COLUMN library_adds_json TEXT NOT NULL DEFAULT '[]'",
+        ]:
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 init_db()
 
 def now(): return time.time()
@@ -174,9 +173,15 @@ class H(BaseHTTPRequestHandler):
                 c.execute("UPDATE jobs SET status='dispatched', updated_at=? WHERE job_id=?",
                           (now(), row["job_id"]))
                 c.commit()
+                try:
+                    library_adds = json.loads(row["library_adds_json"] or "[]")
+                    if not isinstance(library_adds, list): library_adds = []
+                except Exception:
+                    library_adds = []
                 job = {"job_id": row["job_id"], "machine_id": row["machine_id"],
                        "name": row["name"], "folder": row["folder"],
-                       "files": json.loads(row["files_json"])}
+                       "files": json.loads(row["files_json"]),
+                       "library_adds": library_adds}
             return self._send_json(200, job)
         if u.path.startswith("/api/job/files/"):
             parts = u.path.split("/")
@@ -198,10 +203,8 @@ class H(BaseHTTPRequestHandler):
             b = self._read_json()
             mid, name = b.get("machine_id"), b.get("name", "Unknown")
             if not mid: return self._send_json(400, {"error": "missing machine_id"})
-            # New: agents now report what's in their Ministries playlist.
             pres = b.get("presentations", [])
             if not isinstance(pres, list): pres = []
-            # Cap to keep DB rows small + defend against accidental flood
             pres = [str(p)[:200] for p in pres[:200]]
             pres_json = json.dumps(pres)
             with db_lock, db() as c:
@@ -320,6 +323,7 @@ f.addEventListener('submit', async e => {
         raw = self.rfile.read(length)
         parts = raw.split(b"--" + boundary)
         machine_id = name = None
+        library_adds_raw = ""
         files = []
         for p in parts:
             p = p.strip(b"\r\n")
@@ -338,13 +342,26 @@ f.addEventListener('submit', async e => {
                 machine_id = content.decode()
             elif field_name == "name":
                 name = content.decode()
-        if not machine_id or not name or not files:
-            return self._send_json(400, {"error": "need machine_id, name, files"})
+            elif field_name == "library_adds":
+                library_adds_raw = content.decode()
+        library_adds = []
+        if library_adds_raw:
+            try:
+                parsed = json.loads(library_adds_raw)
+                if isinstance(parsed, list):
+                    library_adds = [str(x)[:200] for x in parsed[:50] if x]
+            except Exception:
+                pass
+        if not machine_id:
+            return self._send_json(400, {"error": "need machine_id"})
+        has_new = bool(name and files)
+        has_existing = bool(library_adds)
+        if not has_new and not has_existing:
+            return self._send_json(400, {"error": "need either (name + files) or library_adds"})
         jid = str(uuid.uuid4())
         jdir = os.path.join(UPLOAD_DIR, jid)
         os.makedirs(jdir, exist_ok=True)
         saved = []
-        # First pass: save all files (and remember which are .pptx)
         pptx_paths = []
         for fname, data in files:
             safe = sanitize_filename(os.path.basename(fname))
@@ -360,29 +377,30 @@ f.addEventListener('submit', async e => {
                 pptx_paths.append(full)
             else:
                 saved.append(final)
-        # Second pass: convert any .pptx to PNG slides
         for pptx in pptx_paths:
             try:
                 pngs = convert_pptx_to_pngs(pptx, jdir)
                 saved.extend(pngs)
-                # Delete the .pptx itself — agent doesn't need it
                 try: os.remove(pptx)
                 except Exception: pass
             except Exception as e:
                 log.error(f"PPTX conversion failed for {pptx}: {e}")
                 return self._send_json(500, {"error": f"PPTX conversion failed: {e}"})
-        if not saved:
+        if has_new and not saved:
             return self._send_json(400, {"error": "no usable files after processing"})
+        display_name = name if name else f"+{len(library_adds)} from library"
         ts = now()
         with db_lock, db() as c:
             if not c.execute("SELECT 1 FROM agents WHERE machine_id=?", (machine_id,)).fetchone():
                 c.execute("INSERT INTO agents(machine_id, name, last_seen, presentations) VALUES(?,?,0,'[]')",
                           (machine_id, "(offline)"))
             c.execute("INSERT INTO jobs(job_id, machine_id, name, status, folder, files_json, "
-                      "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                      (jid, machine_id, name, "queued", jdir, json.dumps(saved), ts, ts))
+                      "library_adds_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (jid, machine_id, display_name, "queued", jdir,
+                       json.dumps(saved), json.dumps(library_adds), ts, ts))
             c.commit()
-        log.info(f"  -> Job {jid[:8]} queued for {machine_id}: '{name}' ({len(saved)} files)")
+        log.info(f"  -> Job {jid[:8]} queued for {machine_id}: '{display_name}' "
+                 f"({len(saved)} files, {len(library_adds)} library_adds)")
         return self._send_json(200, {"job_id": jid, "status": "queued"})
 
 
