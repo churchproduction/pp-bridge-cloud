@@ -3,16 +3,15 @@ import json, os, time, uuid, threading, sqlite3, logging, re, unicodedata, subpr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
-PORT       = int(os.environ.get("PORT", "8787"))
-DB_PATH    = os.environ.get("DB_PATH", "/tmp/ppbridge.db")
+PORT = int(os.environ.get("PORT", "8787"))
+DB_PATH = os.environ.get("DB_PATH", "/tmp/ppbridge.db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/ppbridge-uploads")
 HEARTBEAT_TIMEOUT = 90
 MAX_UPLOAD = 200 * 1024 * 1024
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("cloud")
-
 
 def sanitize_filename(name):
     """Strip unicode oddities (narrow space, smart quotes, emoji), unsafe chars."""
@@ -21,7 +20,6 @@ def sanitize_filename(name):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
     name = name.strip(". ")
     return name or "file"
-
 
 def convert_pptx_to_pngs(pptx_path, output_dir):
     """Convert a .pptx to a list of PNGs using LibreOffice + pdftoppm.
@@ -58,7 +56,6 @@ def convert_pptx_to_pngs(pptx_path, output_dir):
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-
 db_lock = threading.Lock()
 
 def db():
@@ -70,33 +67,39 @@ def db():
 def init_db():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS agents (
-            machine_id TEXT PRIMARY KEY,
-            name       TEXT NOT NULL,
-            last_seen  REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS jobs (
-            job_id      TEXT PRIMARY KEY,
-            machine_id  TEXT NOT NULL,
-            name        TEXT NOT NULL,
-            status      TEXT NOT NULL,
-            folder      TEXT NOT NULL,
-            files_json  TEXT NOT NULL,
-            result      TEXT DEFAULT '',
-            created_at  REAL NOT NULL,
-            updated_at  REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_jobs_machine_status ON jobs(machine_id, status);
+            CREATE TABLE IF NOT EXISTS agents (
+                machine_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                last_seen REAL NOT NULL,
+                presentations TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                folder TEXT NOT NULL,
+                files_json TEXT NOT NULL,
+                result TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_machine_status ON jobs(machine_id, status);
         """)
+        # Defensive: add presentations column if upgrading an existing DB
+        # (no-op when /tmp wiped by Render redeploy, but harmless and future-proof).
+        try:
+            c.execute("ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 init_db()
 
 def now(): return time.time()
 def is_online_row(r): return r and (now() - r["last_seen"]) < HEARTBEAT_TIMEOUT
 
-
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        log.info(f"{self.command} {self.path}  ->  {args[1]}")
+        log.info(f"{self.command} {self.path} -> {args[1]}")
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -145,9 +148,15 @@ class H(BaseHTTPRequestHandler):
                 for r in rows:
                     q = c.execute("SELECT COUNT(*) FROM jobs WHERE machine_id=? AND status='queued'",
                                   (r["machine_id"],)).fetchone()[0]
+                    try:
+                        pres = json.loads(r["presentations"] or "[]")
+                        if not isinstance(pres, list): pres = []
+                    except Exception:
+                        pres = []
                     agents.append({"machine_id": r["machine_id"], "name": r["name"],
                                    "online": is_online_row(r), "queued": q,
-                                   "last_seen_ago": round(now() - r["last_seen"], 1)})
+                                   "last_seen_ago": round(now() - r["last_seen"], 1),
+                                   "presentations": pres})
                 jobs = [{"job_id": j["job_id"], "machine_id": j["machine_id"],
                          "name": j["name"], "status": j["status"], "result": j["result"]}
                         for j in c.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 30")]
@@ -189,14 +198,20 @@ class H(BaseHTTPRequestHandler):
             b = self._read_json()
             mid, name = b.get("machine_id"), b.get("name", "Unknown")
             if not mid: return self._send_json(400, {"error": "missing machine_id"})
+            # New: agents now report what's in their Ministries playlist.
+            pres = b.get("presentations", [])
+            if not isinstance(pres, list): pres = []
+            # Cap to keep DB rows small + defend against accidental flood
+            pres = [str(p)[:200] for p in pres[:200]]
+            pres_json = json.dumps(pres)
             with db_lock, db() as c:
                 if c.execute("SELECT 1 FROM agents WHERE machine_id=?", (mid,)).fetchone():
-                    c.execute("UPDATE agents SET name=?, last_seen=? WHERE machine_id=?",
-                              (name, now(), mid))
+                    c.execute("UPDATE agents SET name=?, last_seen=?, presentations=? WHERE machine_id=?",
+                              (name, now(), pres_json, mid))
                 else:
                     log.info(f"  -> New agent: {name} ({mid})")
-                    c.execute("INSERT INTO agents(machine_id, name, last_seen) VALUES(?,?,?)",
-                              (mid, name, now()))
+                    c.execute("INSERT INTO agents(machine_id, name, last_seen, presentations) VALUES(?,?,?,?)",
+                              (mid, name, now(), pres_json))
                 c.commit()
             return self._send_json(200, {"ok": True})
         if u.path.startswith("/api/agent/result/"):
@@ -244,13 +259,13 @@ button:disabled{opacity:.5}
 <h1>Upload to ProPresenter</h1>
 <div class=sub>Submits to the Ministries playlist. Images, videos, or .pptx all work.</div>
 <form id=f>
-<label>Presentation name</label>
-<input name=name placeholder="Sunday Announcements" required>
-<label>Send to</label>
-<select name=machine_id required id=machineSelect></select>
-<label>Files (images / videos / .pptx)</label>
-<input type=file name=files multiple required accept="image/*,video/*,.pptx">
-<button type=submit id=submitBtn>Submit</button>
+  <label>Presentation name</label>
+  <input name=name placeholder="Sunday Announcements" required>
+  <label>Send to</label>
+  <select name=machine_id required id=machineSelect></select>
+  <label>Files (images / videos / .pptx)</label>
+  <input type=file name=files multiple required accept="image/*,video/*,.pptx">
+  <button type=submit id=submitBtn>Submit</button>
 </form>
 <div id=status class=status></div>
 <script>
@@ -361,7 +376,7 @@ f.addEventListener('submit', async e => {
         ts = now()
         with db_lock, db() as c:
             if not c.execute("SELECT 1 FROM agents WHERE machine_id=?", (machine_id,)).fetchone():
-                c.execute("INSERT INTO agents(machine_id, name, last_seen) VALUES(?,?,0)",
+                c.execute("INSERT INTO agents(machine_id, name, last_seen, presentations) VALUES(?,?,0,'[]')",
                           (machine_id, "(offline)"))
             c.execute("INSERT INTO jobs(job_id, machine_id, name, status, folder, files_json, "
                       "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
