@@ -1,4 +1,4 @@
-"""ProPresenter Bridge — generator."""
+"""ProPresenter Bridge — generator + remote-control commands."""
 import os, sys, json, uuid, shutil, glob, time, re, unicodedata
 import urllib.request, urllib.parse
 import importlib.util
@@ -6,7 +6,7 @@ import importlib.util
 HOST, PORT, PASSWORD = "localhost", 1025, "FishHawk"
 LIBRARY_DIR = os.path.expanduser("~/Documents/ProPresenter/Libraries")
 ASSETS_DIR  = os.path.expanduser("~/Documents/ProPresenter/Media/Assets")
-MIN_PLAYLIST_UUID = "1E89A841-7ED9-4A25-B1E8-89EAEC855827"
+MIN_PLAYLIST_UUID = "11221733-3866-44D9-9CDC-6FCA837691C1"
 PROTO_ROOT = os.path.expanduser("~/pp-bridge/proto-schema")
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".heic", ".tiff", ".bmp", ".gif")
@@ -75,6 +75,12 @@ def api(method, path, body=None):
         t = r.read().decode("utf-8")
         return json.loads(t) if t.strip() else None
 
+def api_raw(path):
+    """GET request that returns raw bytes (for thumbnails)."""
+    url = f"http://{HOST}:{PORT}/v1{path}?password={urllib.parse.quote(PASSWORD)}"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return r.read()
+
 def sanitize_name(name):
     name = unicodedata.normalize("NFKD", name)
     name = name.encode("ascii", "ignore").decode("ascii")
@@ -108,19 +114,7 @@ def delete_presentation(raw):
     if os.path.isdir(assets): shutil.rmtree(assets); print("  deleted assets")
 
 def normalize_v21_item(it):
-    """Ensure an item from GET response has all fields needed for PUT.
-    Handles both presentation items and header items (different shapes in v21)."""
-    item_type = it.get("type", "presentation")
-    if item_type == "header":
-        # Headers need destination + target_uuid (use empty string)
-        if "destination" not in it:
-            it["destination"] = "presentation"
-        if "target_uuid" not in it:
-            it["target_uuid"] = ""
-        # Headers don't have presentation_info — strip if present
-        it.pop("presentation_info", None)
-        return it
-    # Default: presentation item
+    """Ensure an item from GET response has all fields needed for PUT."""
     info = it.get("presentation_info", {}) or {}
     pres_uuid = info.get("presentation_uuid", "")
     if "target_uuid" not in it:
@@ -271,9 +265,128 @@ def create_presentation(raw, folder):
     api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", items)
     print(f"\nDone — '{name}' ({len(copied)} slides)\n")
 
+# =============================================================================
+# REMOTE-CONTROL COMMANDS (added for production GUI)
+# All emit JSON to stdout for the agent to forward back to the cloud.
+# =============================================================================
+
+def _emit(obj):
+    print(json.dumps(obj))
+
+def list_ministries():
+    """Emit Ministries playlist items as JSON list."""
+    pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
+    items = pl.get("items", []) if pl else []
+    out = []
+    for it in items:
+        info = it.get("presentation_info", {}) or {}
+        out.append({
+            "item_uuid": it.get("id", {}).get("uuid", ""),
+            "name": it.get("id", {}).get("name", ""),
+            "type": it.get("type", "presentation"),
+            "presentation_uuid": info.get("presentation_uuid", ""),
+            "is_hidden": it.get("is_hidden", False),
+        })
+    _emit({"ok": True, "playlist_uuid": MIN_PLAYLIST_UUID, "items": out})
+
+def get_slides(pres_uuid):
+    """Emit slides of a presentation as JSON, with flat cue indices."""
+    p = api("GET", f"/presentation/{pres_uuid}")
+    pres = p.get("presentation", {}) if p else {}
+    groups = pres.get("groups", [])
+    slides = []
+    cue = 0
+    for g in groups:
+        gname = g.get("name", "")
+        gcolor = g.get("color", {})
+        for s in g.get("slides", []):
+            slides.append({
+                "cue": cue,
+                "group_name": gname,
+                "group_color": gcolor,
+                "text": s.get("text", ""),
+                "label": s.get("label", ""),
+                "enabled": s.get("enabled", True),
+            })
+            cue += 1
+    _emit({
+        "ok": True,
+        "presentation_uuid": pres_uuid,
+        "name": pres.get("id", {}).get("name", ""),
+        "slides": slides,
+    })
+
+def trigger_slide(item_uuid, cue_index):
+    """Trigger a slide via playlist path: /playlist/<min>/<item>/<cue>/trigger."""
+    cue = int(cue_index)
+    api("GET", f"/playlist/{MIN_PLAYLIST_UUID}/{item_uuid}/{cue}/trigger")
+    _emit({"ok": True, "item_uuid": item_uuid, "cue": cue})
+
+def trigger_next():
+    api("GET", "/trigger/next")
+    _emit({"ok": True, "action": "next"})
+
+def trigger_previous():
+    api("GET", "/trigger/previous")
+    _emit({"ok": True, "action": "previous"})
+
+def clear_slide():
+    api("GET", "/clear/layer/slide")
+    _emit({"ok": True, "action": "clear"})
+
+def delete_from_ministries(item_uuid):
+    """Remove a single playlist item by item_uuid. Does NOT delete the .pro."""
+    pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
+    items = pl.get("items", []) if pl else []
+    new_items, removed_name = [], None
+    for it in items:
+        if it.get("id", {}).get("uuid") == item_uuid:
+            removed_name = it.get("id", {}).get("name", "")
+            continue
+        new_items.append(normalize_v21_item(it))
+    if removed_name is None:
+        _emit({"ok": False, "error": "item_uuid not found in Ministries"})
+        sys.exit(2)
+    api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", new_items)
+    _emit({"ok": True, "removed": removed_name, "remaining": len(new_items)})
+
+def reorder_ministries(item_uuids_csv):
+    """Reorder Ministries by comma-separated item UUIDs. Must be a perfect permutation."""
+    new_order = [u.strip() for u in item_uuids_csv.split(",") if u.strip()]
+    pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
+    items = pl.get("items", []) if pl else []
+    by_uuid = {it.get("id", {}).get("uuid", ""): it for it in items}
+    if set(new_order) != set(by_uuid.keys()):
+        _emit({
+            "ok": False,
+            "error": "uuids must be a permutation of current items",
+            "missing": list(set(by_uuid.keys()) - set(new_order)),
+            "extra": list(set(new_order) - set(by_uuid.keys())),
+        })
+        sys.exit(2)
+    new_items = [normalize_v21_item(by_uuid[u]) for u in new_order]
+    api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", new_items)
+    _emit({"ok": True, "reordered": len(new_items)})
+
+def get_thumbnail(pres_uuid, cue_index, output_path):
+    """Download thumbnail JPEG for a specific cue to output_path."""
+    cue = int(cue_index)
+    data = api_raw(f"/presentation/{pres_uuid}/thumbnail/{cue}")
+    with open(output_path, "wb") as f:
+        f.write(data)
+    _emit({"ok": True, "path": output_path, "bytes": len(data)})
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: bridge.py create <name> <folder> | delete <name> | add_existing <name>"); sys.exit(1)
+        print("Usage: bridge.py <command> [args]")
+        print("  Content:   create <name> <folder> | delete <name> | add_existing <name>")
+        print("  Remote:    list_ministries | get_slides <pres_uuid>")
+        print("             trigger_slide <item_uuid> <cue_index>")
+        print("             trigger_next | trigger_previous | clear_slide")
+        print("             delete_from_min <item_uuid>")
+        print("             reorder_min <uuid1,uuid2,...>")
+        print("             get_thumbnail <pres_uuid> <cue_index> <output_path>")
+        sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "create":
         if len(sys.argv) < 4: print("Usage: bridge.py create <name> <folder>"); sys.exit(1)
@@ -284,5 +397,27 @@ if __name__ == "__main__":
     elif cmd == "add_existing":
         if len(sys.argv) < 3: print("Usage: bridge.py add_existing <name>"); sys.exit(1)
         add_existing_to_ministries(sys.argv[2])
+    elif cmd == "list_ministries":
+        list_ministries()
+    elif cmd == "get_slides":
+        if len(sys.argv) < 3: print("Usage: bridge.py get_slides <pres_uuid>"); sys.exit(1)
+        get_slides(sys.argv[2])
+    elif cmd == "trigger_slide":
+        if len(sys.argv) < 4: print("Usage: bridge.py trigger_slide <item_uuid> <cue_index>"); sys.exit(1)
+        trigger_slide(sys.argv[2], sys.argv[3])
+    elif cmd == "trigger_next":
+        trigger_next()
+    elif cmd == "trigger_previous":
+        trigger_previous()
+    elif cmd == "clear_slide":
+        clear_slide()
+    elif cmd == "delete_from_min":
+        if len(sys.argv) < 3: print("Usage: bridge.py delete_from_min <item_uuid>"); sys.exit(1)
+        delete_from_ministries(sys.argv[2])
+    elif cmd == "reorder_min":
+        if len(sys.argv) < 3: print("Usage: bridge.py reorder_min <uuid1,uuid2,...>"); sys.exit(1)
+        reorder_ministries(sys.argv[2])
+    elif cmd == "get_thumbnail":
+        if len(sys.argv) < 5: print("Usage: bridge.py get_thumbnail <pres_uuid> <cue_index> <output_path>"); sys.exit(1)
+        get_thumbnail(sys.argv[2], sys.argv[3], sys.argv[4])
     else: print(f"Unknown: {cmd}"); sys.exit(1)
-
