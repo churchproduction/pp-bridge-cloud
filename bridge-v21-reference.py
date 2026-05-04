@@ -3,10 +3,22 @@ import os, sys, json, uuid, shutil, glob, time, re, unicodedata
 import urllib.request, urllib.parse
 import importlib.util
 
+# Per-Mac identity lives in ~/pp-bridge/config.py — required.
+# Format:
+#   MACHINE_ID = "building-c-side-screens"
+#   MACHINE_NAME = "Building C Side Screens"
+#   MIN_PLAYLIST_UUID = "..."
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from config import MIN_PLAYLIST_UUID
+except ImportError:
+    print("FATAL: ~/pp-bridge/config.py is missing or doesn't define MIN_PLAYLIST_UUID.", file=sys.stderr)
+    print("Create it with the per-Mac constants. See the deploy notes.", file=sys.stderr)
+    sys.exit(2)
+
 HOST, PORT, PASSWORD = "localhost", 1025, "FishHawk"
 LIBRARY_DIR = os.path.expanduser("~/Documents/ProPresenter/Libraries")
 ASSETS_DIR  = os.path.expanduser("~/Documents/ProPresenter/Media/Assets")
-MIN_PLAYLIST_UUID = "11221733-3866-44D9-9CDC-6FCA837691C1"
 PROTO_ROOT = os.path.expanduser("~/pp-bridge/proto-schema")
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".heic", ".tiff", ".bmp", ".gif")
