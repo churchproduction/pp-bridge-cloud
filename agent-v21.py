@@ -1,14 +1,26 @@
 """PP Bridge Agent — job runner + control-job runner (second thread)."""
 import os, json, time, subprocess, traceback, shutil, threading
+import sys
 import urllib.request, urllib.error, urllib.parse
 from urllib.parse import urlparse, parse_qs
 
+# Per-Mac identity lives in ~/pp-bridge/config.py — required.
+# Format:
+#   MACHINE_ID = "building-c-side-screens"
+#   MACHINE_NAME = "Building C Side Screens"
+#   MIN_PLAYLIST_UUID = "..."  # used by bridge.py
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from config import MACHINE_ID, MACHINE_NAME
+except ImportError:
+    print("FATAL: ~/pp-bridge/config.py is missing or doesn't define MACHINE_ID and MACHINE_NAME.", file=sys.stderr)
+    print("Create it with the per-Mac constants. See the deploy notes.", file=sys.stderr)
+    sys.exit(2)
+
 # ── Config ─────────────────────────────────────────────────────────
 CLOUD_URL    = "https://pp-bridge-cloud.onrender.com"
-MACHINE_ID   = "building-c-side-screens"
-MACHINE_NAME = "Building C Side Screens"
 
-# ProPresenter API (per-machine — Building C Side Screens)
+# ProPresenter API (uniform across all Macs since v21 migration)
 PP_API_PORT = 1025
 PP_API_PASSWORD = "FishHawk"
 BRIDGE_SCRIPT = os.path.expanduser("~/pp-bridge/bridge.py")
