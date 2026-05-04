@@ -6,7 +6,7 @@ import importlib.util
 HOST, PORT, PASSWORD = "localhost", 1025, "FishHawk"
 LIBRARY_DIR = os.path.expanduser("~/Documents/ProPresenter/Libraries")
 ASSETS_DIR  = os.path.expanduser("~/Documents/ProPresenter/Media/Assets")
-MIN_PLAYLIST_UUID = "11221733-3866-44D9-9CDC-6FCA837691C1"
+MIN_PLAYLIST_UUID = "1E89A841-7ED9-4A25-B1E8-89EAEC855827"
 PROTO_ROOT = os.path.expanduser("~/pp-bridge/proto-schema")
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".heic", ".tiff", ".bmp", ".gif")
@@ -108,7 +108,19 @@ def delete_presentation(raw):
     if os.path.isdir(assets): shutil.rmtree(assets); print("  deleted assets")
 
 def normalize_v21_item(it):
-    """Ensure an item from GET response has all fields needed for PUT."""
+    """Ensure an item from GET response has all fields needed for PUT.
+    Handles both presentation items and header items (different shapes in v21)."""
+    item_type = it.get("type", "presentation")
+    if item_type == "header":
+        # Headers need destination + target_uuid (use empty string)
+        if "destination" not in it:
+            it["destination"] = "presentation"
+        if "target_uuid" not in it:
+            it["target_uuid"] = ""
+        # Headers don't have presentation_info — strip if present
+        it.pop("presentation_info", None)
+        return it
+    # Default: presentation item
     info = it.get("presentation_info", {}) or {}
     pres_uuid = info.get("presentation_uuid", "")
     if "target_uuid" not in it:
