@@ -1,4 +1,4 @@
-"""ProPresenter Bridge — Production Cloud Server (with PowerPoint conversion)."""
+"""ProPresenter Bridge — Production Cloud Server (with PowerPoint conversion + remote control)."""
 import json, os, time, uuid, threading, sqlite3, logging, re, unicodedata, subprocess, shutil, tempfile, glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
@@ -8,6 +8,10 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/ppbridge.db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/ppbridge-uploads")
 HEARTBEAT_TIMEOUT = 90
 MAX_UPLOAD = 200 * 1024 * 1024
+
+# Control-job tuning
+AGENT_LONGPOLL_SECONDS = 25     # how long the agent's GET hangs waiting for a control job
+CONTROL_RESULT_TIMEOUT = 15     # how long the frontend POST waits for the agent to finish
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -82,6 +86,18 @@ def init_db():
                 updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_machine_status ON jobs(machine_id, status);
+            CREATE TABLE IF NOT EXISTS control_jobs (
+                job_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                command TEXT NOT NULL,
+                args_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL,
+                result_json TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_control_machine_status ON control_jobs(machine_id, status);
+            CREATE INDEX IF NOT EXISTS idx_control_created ON control_jobs(created_at);
         """)
         for ddl in [
             "ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'",
@@ -96,8 +112,34 @@ init_db()
 def now(): return time.time()
 def is_online_row(r): return r and (now() - r["last_seen"]) < HEARTBEAT_TIMEOUT
 
+# =============================================================================
+# Periodic cleanup — remove old finished/abandoned control jobs so the table
+# doesn't grow indefinitely. Runs in a background thread.
+# =============================================================================
+def control_cleanup_loop():
+    while True:
+        try:
+            with db_lock, db() as c:
+                cutoff_done = now() - 600        # 10 min for completed
+                cutoff_orphan = now() - 120      # 2 min for stuck dispatched/queued
+                c.execute("DELETE FROM control_jobs WHERE status IN ('done','failed') AND updated_at < ?",
+                          (cutoff_done,))
+                c.execute("UPDATE control_jobs SET status='failed', result_json=?, updated_at=? "
+                          "WHERE status IN ('queued','dispatched') AND created_at < ?",
+                          (json.dumps({"ok": False, "error": "agent did not respond in time"}),
+                           now(), cutoff_orphan))
+                c.commit()
+        except Exception as e:
+            log.warning(f"control cleanup error: {e}")
+        time.sleep(60)
+
+threading.Thread(target=control_cleanup_loop, daemon=True).start()
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
+        # Skip noisy long-poll log lines
+        if "/api/control/poll/" in self.path and args and args[1] == "200":
+            return
         log.info(f"{self.command} {self.path} -> {args[1]}")
 
     def _cors(self):
@@ -183,6 +225,8 @@ class H(BaseHTTPRequestHandler):
                        "files": json.loads(row["files_json"]),
                        "library_adds": library_adds}
             return self._send_json(200, job)
+        if u.path.startswith("/api/control/poll/"):
+            return self._control_poll(u.path.rsplit("/", 1)[-1])
         if u.path.startswith("/api/job/files/"):
             parts = u.path.split("/")
             if len(parts) < 6: return self._send_json(400, {"error": "bad path"})
@@ -226,9 +270,128 @@ class H(BaseHTTPRequestHandler):
                 c.commit()
             log.info(f"  -> Job {jid[:8]} {'done' if ok else 'failed'}: {msg}")
             return self._send_json(200, {"ok": True})
+        if u.path.startswith("/api/control/result/"):
+            return self._control_result()
+        if u.path == "/api/control":
+            return self._control_submit()
         if u.path == "/api/jobs":
             return self._submit_job()
         return self._send_json(404, {"error": "not found"})
+
+    # =========================================================================
+    # CONTROL JOBS — synchronous remote-control over the agent's bridge.py
+    # =========================================================================
+    # Allowed commands the frontend can send. Anything not in this list is rejected.
+    CONTROL_COMMANDS = {
+        # read-only
+        "list_ministries":   {"args": 0, "max_wait": 10},
+        "get_slides":        {"args": 1, "max_wait": 10},
+        # mutations
+        "delete_from_min":   {"args": 1, "max_wait": 12},
+        "reorder_min":       {"args": 1, "max_wait": 12},
+        # triggers (fast — short timeout)
+        "trigger_slide":     {"args": 2, "max_wait": 6},
+        "trigger_next":      {"args": 0, "max_wait": 6},
+        "trigger_previous":  {"args": 0, "max_wait": 6},
+        "clear_slide":       {"args": 0, "max_wait": 6},
+    }
+
+    def _control_submit(self):
+        """Frontend submits a control job and waits synchronously for the result."""
+        b = self._read_json()
+        mid = b.get("machine_id")
+        cmd = b.get("command")
+        args = b.get("args", [])
+        if not mid or not cmd:
+            return self._send_json(400, {"error": "need machine_id and command"})
+        if cmd not in self.CONTROL_COMMANDS:
+            return self._send_json(400, {"error": f"unknown command: {cmd}"})
+        spec = self.CONTROL_COMMANDS[cmd]
+        if not isinstance(args, list):
+            return self._send_json(400, {"error": "args must be a list"})
+        if len(args) != spec["args"]:
+            return self._send_json(400, {"error": f"{cmd} expects {spec['args']} arg(s), got {len(args)}"})
+        args = [str(a)[:1000] for a in args]
+        # Verify the agent exists
+        with db_lock, db() as c:
+            ag = c.execute("SELECT * FROM agents WHERE machine_id=?", (mid,)).fetchone()
+        if not ag:
+            return self._send_json(404, {"error": "unknown machine_id"})
+        if not is_online_row(ag):
+            return self._send_json(503, {"error": "machine offline"})
+        jid = uuid.uuid4().hex
+        ts = now()
+        with db_lock, db() as c:
+            c.execute("INSERT INTO control_jobs(job_id, machine_id, command, args_json, status, "
+                      "result_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                      (jid, mid, cmd, json.dumps(args), "queued", "", ts, ts))
+            c.commit()
+        # Wait up to spec["max_wait"] for the agent to complete the job
+        deadline = time.time() + min(spec["max_wait"], CONTROL_RESULT_TIMEOUT)
+        while time.time() < deadline:
+            with db_lock, db() as c:
+                row = c.execute("SELECT status, result_json FROM control_jobs WHERE job_id=?",
+                                (jid,)).fetchone()
+            if row and row["status"] in ("done", "failed"):
+                try:
+                    result = json.loads(row["result_json"]) if row["result_json"] else None
+                except Exception:
+                    result = {"ok": False, "error": "malformed result"}
+                return self._send_json(200, {
+                    "job_id": jid,
+                    "ok": row["status"] == "done" and (result.get("ok", True) if isinstance(result, dict) else True),
+                    "result": result,
+                })
+            time.sleep(0.1)
+        return self._send_json(504, {"job_id": jid, "ok": False,
+                                     "error": f"timed out after {spec['max_wait']}s"})
+
+    def _control_poll(self, mid):
+        """Agent's long-poll endpoint. Hangs up to AGENT_LONGPOLL_SECONDS waiting for a queued control job."""
+        # Verify the agent
+        with db_lock, db() as c:
+            if not c.execute("SELECT 1 FROM agents WHERE machine_id=?", (mid,)).fetchone():
+                return self._send_json(404, {"error": "unknown agent"})
+            c.execute("UPDATE agents SET last_seen=? WHERE machine_id=?", (now(), mid))
+            c.commit()
+        deadline = time.time() + AGENT_LONGPOLL_SECONDS
+        while time.time() < deadline:
+            with db_lock, db() as c:
+                row = c.execute("SELECT * FROM control_jobs WHERE machine_id=? AND status='queued' "
+                                "ORDER BY created_at LIMIT 1", (mid,)).fetchone()
+                if row:
+                    c.execute("UPDATE control_jobs SET status='dispatched', updated_at=? WHERE job_id=?",
+                              (now(), row["job_id"]))
+                    c.commit()
+                    try:
+                        args = json.loads(row["args_json"] or "[]")
+                    except Exception:
+                        args = []
+                    return self._send_json(200, {
+                        "job_id": row["job_id"],
+                        "command": row["command"],
+                        "args": args,
+                    })
+            time.sleep(0.15)
+        return self._send_json(200, None)
+
+    def _control_result(self):
+        """Agent reports a control-job result back to the cloud."""
+        b = self._read_json()
+        jid = b.get("job_id")
+        ok = bool(b.get("ok"))
+        result = b.get("result")
+        if not jid:
+            return self._send_json(400, {"error": "missing job_id"})
+        try:
+            rj = json.dumps(result) if result is not None else ""
+        except Exception:
+            rj = json.dumps({"ok": False, "error": "could not serialize result"})
+        with db_lock, db() as c:
+            c.execute("UPDATE control_jobs SET status=?, result_json=?, updated_at=? WHERE job_id=?",
+                      ("done" if ok else "failed", rj, now(), jid))
+            c.commit()
+        return self._send_json(200, {"ok": True})
 
     def _upload_form(self):
         agents_json = "[]"
