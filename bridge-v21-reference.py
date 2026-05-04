@@ -376,6 +376,30 @@ def get_thumbnail(pres_uuid, cue_index, output_path):
         f.write(data)
     _emit({"ok": True, "path": output_path, "bytes": len(data)})
 
+def get_thumbnails_bulk(pres_uuid):
+    """Fetch every slide thumbnail for a presentation in parallel; emit base64 dict.
+    Used by the remote control UI for the slide grid. PP serves thumbnails fast
+    (~30ms each) so 8-way parallelism keeps even a 30-slide presentation under 1s."""
+    import base64
+    from concurrent.futures import ThreadPoolExecutor
+    p = api("GET", f"/presentation/{pres_uuid}")
+    pres = p.get("presentation", {}) if p else {}
+    total = sum(len(g.get("slides", [])) for g in pres.get("groups", []))
+    if total == 0:
+        _emit({"ok": True, "presentation_uuid": pres_uuid, "count": 0, "thumbnails": {}})
+        return
+    def fetch_one(cue):
+        try:
+            data = api_raw(f"/presentation/{pres_uuid}/thumbnail/{cue}")
+            return cue, base64.b64encode(data).decode("ascii")
+        except Exception:
+            return cue, None
+    out = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for cue, b64 in ex.map(fetch_one, range(total)):
+            out[str(cue)] = b64
+    _emit({"ok": True, "presentation_uuid": pres_uuid, "count": total, "thumbnails": out})
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: bridge.py <command> [args]")
@@ -386,6 +410,7 @@ if __name__ == "__main__":
         print("             delete_from_min <item_uuid>")
         print("             reorder_min <uuid1,uuid2,...>")
         print("             get_thumbnail <pres_uuid> <cue_index> <output_path>")
+        print("             get_thumbnails_bulk <pres_uuid>")
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "create":
@@ -420,4 +445,7 @@ if __name__ == "__main__":
     elif cmd == "get_thumbnail":
         if len(sys.argv) < 5: print("Usage: bridge.py get_thumbnail <pres_uuid> <cue_index> <output_path>"); sys.exit(1)
         get_thumbnail(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd == "get_thumbnails_bulk":
+        if len(sys.argv) < 3: print("Usage: bridge.py get_thumbnails_bulk <pres_uuid>"); sys.exit(1)
+        get_thumbnails_bulk(sys.argv[2])
     else: print(f"Unknown: {cmd}"); sys.exit(1)
