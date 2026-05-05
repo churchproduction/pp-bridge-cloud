@@ -210,7 +210,12 @@ def discord_post(channel, embed):
             req = _urlreq.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    # Discord blocks Python-urllib's default User-Agent.
+                    # Any meaningful UA string is accepted.
+                    "User-Agent": "PP-Bridge-Cloud (https://github.com/churchproduction/pp-bridge-cloud)",
+                },
                 method="POST",
             )
             _urlreq.urlopen(req, timeout=5)
