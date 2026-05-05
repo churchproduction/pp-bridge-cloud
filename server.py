@@ -1,5 +1,10 @@
 """ProPresenter Bridge — Production Cloud Server (with PowerPoint conversion + remote control)."""
 import json, os, time, uuid, threading, sqlite3, logging, re, unicodedata, subprocess, shutil, tempfile, glob
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+ — used for service-time lockout
+except ImportError:
+    ZoneInfo = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
@@ -98,6 +103,10 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_control_machine_status ON control_jobs(machine_id, status);
             CREATE INDEX IF NOT EXISTS idx_control_created ON control_jobs(created_at);
+            CREATE TABLE IF NOT EXISTS meta (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL DEFAULT ''
+            );
         """)
         for ddl in [
             "ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'",
@@ -110,6 +119,123 @@ def init_db():
 init_db()
 
 def now(): return time.time()
+
+# ─── Service-time lockout ─────────────────────────────────────────────
+# Blocks /api/control and /api/jobs from accepting user-initiated requests
+# during Sunday morning service hours, unless the request includes a valid
+# X-Lockout-Override header.
+#
+# To adjust: edit these constants and redeploy. To disable entirely, set
+# LOCKOUT_DAY = -1.
+LOCKOUT_DAY = 6                  # Monday=0, ..., Sunday=6.  Use -1 to disable lockout.
+LOCKOUT_START_HOUR = 7           # 7 AM Eastern (24-hour clock)
+LOCKOUT_END_HOUR = 13            # 1 PM Eastern (exclusive — 12:59 locked, 13:00 open)
+LOCKOUT_TZ = "America/New_York"  # zoneinfo handles DST automatically
+# SHA256(salt + "Educator123!") where salt = "pp-bridge-control-2026"
+LOCKOUT_OVERRIDE_HASH = "0b50f7b941b65e01ee453f57a2e7557837034342005bdcb344a6e446f4af27ec"
+
+def is_locked_now():
+    """True if we are inside a Sunday service lockout window."""
+    if LOCKOUT_DAY < 0 or ZoneInfo is None:
+        return False
+    try:
+        n = datetime.now(ZoneInfo(LOCKOUT_TZ))
+    except Exception:
+        return False
+    return n.weekday() == LOCKOUT_DAY and LOCKOUT_START_HOUR <= n.hour < LOCKOUT_END_HOUR
+
+def _has_lockout_override(headers):
+    return (headers.get("X-Lockout-Override") or "").strip().lower() == LOCKOUT_OVERRIDE_HASH.lower()
+
+def is_request_blocked(headers):
+    """True if we should reject this request because of the lockout or kill switch."""
+    # Kill switch (admin emergency lockdown) trumps everything — no override works
+    if is_killswitch_active():
+        return True
+    return is_locked_now() and not _has_lockout_override(headers)
+
+# ──────────────────────────────────────────────────────────────────────
+# Emergency kill switch — admin-triggered lockdown that blocks ALL
+# uploads + remote actions. Activated by hitting a secret URL with the
+# correct token. State persists in the meta table so it survives restarts.
+# ──────────────────────────────────────────────────────────────────────
+KILL_SWITCH_TOKEN = (os.environ.get("KILL_SWITCH_TOKEN") or "").strip()
+
+def is_killswitch_active():
+    """True if the admin emergency lockdown is currently engaged."""
+    try:
+        with db_lock, db() as c:
+            r = c.execute("SELECT v FROM meta WHERE k='killswitch'").fetchone()
+        return bool(r and r["v"] == "1")
+    except Exception:
+        # If the meta table doesn't exist yet (fresh install), default to safe-open
+        return False
+
+def set_killswitch(active):
+    with db_lock, db() as c:
+        c.execute("INSERT INTO meta(k, v) VALUES('killswitch', ?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                  ("1" if active else "0",))
+        c.commit()
+
+# ──────────────────────────────────────────────────────────────────────
+# Discord webhook notifications
+# Webhook URLs come from environment variables on Render — never put them
+# in code or commit them. Set in Render Dashboard → Environment.
+# ──────────────────────────────────────────────────────────────────────
+import urllib.request as _urlreq
+
+DISCORD_WEBHOOKS = {
+    "uploads": (os.environ.get("DISCORD_UPLOADS_URL") or "").strip(),
+    "remote":  (os.environ.get("DISCORD_REMOTE_URL")  or "").strip(),
+    "gate":    (os.environ.get("DISCORD_GATE_URL")    or "").strip(),
+}
+
+# Discord embed colors (decimal RGB)
+COLOR_GREEN  = 5763719    # success
+COLOR_RED    = 15548997   # failure
+COLOR_BLUE   = 5793266    # info / control action
+COLOR_GRAY   = 9807270    # neutral / queued
+COLOR_ORANGE = 15105570   # warning / mutation
+
+def discord_post(channel, embed):
+    """Post a single embed to the named Discord channel webhook.
+    Non-blocking — fires off in a background thread, ignores failures."""
+    url = DISCORD_WEBHOOKS.get(channel)
+    if not url:
+        return
+    def _send():
+        try:
+            payload = {"embeds": [embed]}
+            req = _urlreq.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            _urlreq.urlopen(req, timeout=5)
+        except Exception as e:
+            log.warning(f"Discord post to {channel} failed: {e}")
+    threading.Thread(target=_send, daemon=True).start()
+
+def client_ip(handler):
+    """Best-effort client IP extraction. Render's reverse proxy uses X-Forwarded-For."""
+    fwd = handler.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    cf = handler.headers.get("CF-Connecting-IP", "")
+    if cf:
+        return cf.strip()
+    if handler.client_address:
+        return handler.client_address[0]
+    return "unknown"
+
+def short_ua(ua, n=80):
+    """Trim a User-Agent string to its meaningful prefix."""
+    if not ua: return ""
+    return (ua[:n] + "…") if len(ua) > n else ua
+
+# ──────────────────────────────────────────────────────────────────────
 def is_online_row(r): return r and (now() - r["last_seen"]) < HEARTBEAT_TIMEOUT
 
 # =============================================================================
@@ -134,6 +260,42 @@ def control_cleanup_loop():
         time.sleep(60)
 
 threading.Thread(target=control_cleanup_loop, daemon=True).start()
+
+# Agent online/offline watcher — posts to Discord #remote when an agent's
+# status changes. Runs every 30 seconds.
+_agent_watch_state = {}
+def agent_watch_loop():
+    global _agent_watch_state
+    # Seed initial state silently so we don't spam at startup
+    try:
+        with db_lock, db() as c:
+            for r in c.execute("SELECT machine_id, name, last_seen FROM agents").fetchall():
+                _agent_watch_state[r["machine_id"]] = (r["name"], is_online_row(r))
+    except Exception:
+        pass
+    while True:
+        try:
+            with db_lock, db() as c:
+                rows = c.execute("SELECT machine_id, name, last_seen FROM agents").fetchall()
+            for r in rows:
+                mid = r["machine_id"]
+                name = r["name"]
+                online = is_online_row(r)
+                prev = _agent_watch_state.get(mid)
+                if prev is None:
+                    _agent_watch_state[mid] = (name, online)
+                    continue
+                if prev[1] != online:
+                    discord_post("remote", {
+                        "title": (f"🟢 {name} came online" if online else f"🔴 {name} went offline"),
+                        "color": COLOR_GREEN if online else COLOR_RED,
+                        "fields": [{"name": "Machine ID", "value": "`" + mid + "`", "inline": True}],
+                    })
+                _agent_watch_state[mid] = (name, online)
+        except Exception as e:
+            log.warning(f"Agent watcher error: {e}")
+        time.sleep(30)
+threading.Thread(target=agent_watch_loop, daemon=True).start()
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -192,6 +354,60 @@ class H(BaseHTTPRequestHandler):
             return self._send_text(200, "PP Bridge cloud — alive")
         if u.path == "/upload":
             return self._upload_form()
+        # ─── Emergency kill switch (admin) ─────────────────────────────
+        # GET-based so a phone bookmark or Discord-pinned link is one tap.
+        # Token comes from query string, compared to KILL_SWITCH_TOKEN env var.
+        # If token env var is unset, endpoints are disabled (safe default).
+        if u.path in ("/api/admin/lockdown", "/api/admin/unlock", "/api/admin/status"):
+            from urllib.parse import parse_qs
+            qs = parse_qs(u.query or "")
+            given = (qs.get("token", [""])[0] or "").strip()
+            if not KILL_SWITCH_TOKEN:
+                return self._send_json(503, {"error": "kill_switch_disabled",
+                    "message": "Set KILL_SWITCH_TOKEN env var on Render to enable."})
+            if given != KILL_SWITCH_TOKEN:
+                # Don't leak whether the path exists — return generic 404
+                log.warning(f"Kill switch wrong token from {client_ip(self)}")
+                return self._send_json(404, {"error": "not_found"})
+            ip = client_ip(self)
+            ua = short_ua(self.headers.get("User-Agent", ""))
+            if u.path == "/api/admin/status":
+                return self._send_json(200, {
+                    "killswitch_active": is_killswitch_active(),
+                    "lockout_active": is_locked_now(),
+                })
+            if u.path == "/api/admin/lockdown":
+                set_killswitch(True)
+                log.warning(f"🚨 KILL SWITCH ACTIVATED from {ip}")
+                discord_post("gate", {
+                    "title": "🚨 EMERGENCY LOCKDOWN ACTIVATED",
+                    "color": COLOR_RED,
+                    "fields": [
+                        {"name": "From", "value": ip, "inline": True},
+                        {"name": "User-Agent", "value": ua or "—", "inline": False},
+                        {"name": "Status", "value": "All uploads + remote actions BLOCKED. "
+                                                    "No override password works while lockdown is active. "
+                                                    "Visit /api/admin/unlock?token=… to lift.",
+                         "inline": False},
+                    ],
+                })
+                return self._send_text(200,
+                    "🚨 Emergency lockdown ACTIVE. All uploads + remote actions are blocked. "
+                    "Visit /api/admin/unlock?token=YOUR_TOKEN to lift.")
+            if u.path == "/api/admin/unlock":
+                set_killswitch(False)
+                log.warning(f"✅ KILL SWITCH LIFTED from {ip}")
+                discord_post("gate", {
+                    "title": "✅ Emergency lockdown lifted",
+                    "color": COLOR_GREEN,
+                    "fields": [
+                        {"name": "From", "value": ip, "inline": True},
+                        {"name": "User-Agent", "value": ua or "—", "inline": False},
+                        {"name": "Status", "value": "Normal operation restored.", "inline": False},
+                    ],
+                })
+                return self._send_text(200, "✅ Lockdown lifted. Normal operation restored.")
+        # ───────────────────────────────────────────────────────────────
         if u.path == "/api/status":
             with db_lock, db() as c:
                 rows = c.execute("SELECT * FROM agents").fetchall()
@@ -211,7 +427,7 @@ class H(BaseHTTPRequestHandler):
                 jobs = [{"job_id": j["job_id"], "machine_id": j["machine_id"],
                          "name": j["name"], "status": j["status"], "result": j["result"]}
                         for j in c.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 30")]
-            return self._send_json(200, {"agents": agents, "jobs": jobs})
+            return self._send_json(200, {"agents": agents, "jobs": jobs, "lockout": is_locked_now()})
         if u.path.startswith("/api/agent/poll/"):
             mid = u.path.rsplit("/", 1)[-1]
             with db_lock, db() as c:
@@ -277,15 +493,69 @@ class H(BaseHTTPRequestHandler):
             with db_lock, db() as c:
                 c.execute("UPDATE jobs SET status=?, result=?, updated_at=? WHERE job_id=?",
                           ("done" if ok else "failed", msg, now(), jid))
+                # Pull job + agent details for Discord notification
+                row = c.execute("SELECT j.name, j.machine_id, a.name AS mac_name "
+                                "FROM jobs j LEFT JOIN agents a ON j.machine_id=a.machine_id "
+                                "WHERE j.job_id=?", (jid,)).fetchone()
                 c.commit()
             log.info(f"  -> Job {jid[:8]} {'done' if ok else 'failed'}: {msg}")
+            try:
+                pres_name = row["name"] if row else "?"
+                mac_label = (row["mac_name"] if row and row["mac_name"] else (row["machine_id"] if row else "?"))
+                discord_post("uploads", {
+                    "title": ("✅ Upload completed" if ok else "❌ Upload failed"),
+                    "color": COLOR_GREEN if ok else COLOR_RED,
+                    "fields": [
+                        {"name": "To", "value": mac_label, "inline": True},
+                        {"name": "Presentation", "value": pres_name[:200], "inline": True},
+                        {"name": "Result", "value": (msg or "—")[:900], "inline": False},
+                    ],
+                })
+            except Exception as e:
+                log.warning(f"Discord upload-completion notification failed: {e}")
             return self._send_json(200, {"ok": True})
         if u.path.startswith("/api/control/result/"):
             return self._control_result()
         if u.path == "/api/control":
+            if is_request_blocked(self.headers):
+                return self._send_json(423, {"error": "service_lockout",
+                    "message": "Remote is locked during Sunday service hours."})
             return self._control_submit()
         if u.path == "/api/jobs":
+            if is_request_blocked(self.headers):
+                return self._send_json(423, {"error": "service_lockout",
+                    "message": "Uploads are locked during Sunday service hours."})
             return self._submit_job()
+        if u.path == "/api/gate-event":
+            # Frontend reports a gate password attempt (success or fail).
+            # Body: {"success": true|false, "page": "control"|"index", "attempt_hash": "<sha256>"}
+            try:
+                b = self._read_json() or {}
+            except Exception:
+                b = {}
+            success = bool(b.get("success"))
+            page = (b.get("page") or "")[:30]
+            attempt_hash = (b.get("attempt_hash") or "")[:64]
+            ua = short_ua(self.headers.get("User-Agent", ""))
+            try:
+                fields = [
+                    {"name": "From", "value": client_ip(self), "inline": True},
+                    {"name": "Page", "value": "/" + page if page else "?", "inline": True},
+                    {"name": "Status", "value": ("✅ Unlocked" if success else "❌ Failed"), "inline": True},
+                ]
+                if ua:
+                    fields.append({"name": "User-Agent", "value": ua, "inline": False})
+                if not success and attempt_hash:
+                    # Only the hash, never the plaintext password
+                    fields.append({"name": "Attempt hash", "value": "`" + attempt_hash[:16] + "…`", "inline": False})
+                discord_post("gate", {
+                    "title": "🔓 Gate unlocked" if success else "❌ Gate attempt failed",
+                    "color": COLOR_GREEN if success else COLOR_RED,
+                    "fields": fields,
+                })
+            except Exception as e:
+                log.warning(f"Discord gate notification failed: {e}")
+            return self._send_json(200, {"ok": True})
         return self._send_json(404, {"error": "not found"})
 
     # =========================================================================
@@ -348,9 +618,39 @@ class H(BaseHTTPRequestHandler):
                     result = json.loads(row["result_json"]) if row["result_json"] else None
                 except Exception:
                     result = {"ok": False, "error": "malformed result"}
+                final_ok = row["status"] == "done" and (result.get("ok", True) if isinstance(result, dict) else True)
+                # Discord: remote control event
+                try:
+                    mac_label = ag["name"] if ag else mid
+                    args_summary = ", ".join(args)[:100] if args else "—"
+                    summary = ""
+                    if isinstance(result, dict):
+                        if "items" in result and isinstance(result["items"], list):
+                            summary = f"{len(result['items'])} items returned"
+                        elif "removed" in result:
+                            summary = f"Removed: {result.get('removed', '')[:80]}"
+                        elif "action" in result:
+                            summary = f"Action: {result.get('action', '')}"
+                        elif not final_ok:
+                            summary = f"Error: {result.get('error', 'unknown')[:200]}"
+                    fields = [
+                        {"name": "From", "value": client_ip(self), "inline": True},
+                        {"name": "Mac", "value": mac_label, "inline": True},
+                        {"name": "Status", "value": "✅" if final_ok else "❌", "inline": True},
+                        {"name": "Command", "value": f"`{cmd}`" + ((" " + args_summary) if args else ""), "inline": False},
+                    ]
+                    if summary:
+                        fields.append({"name": "Result", "value": summary[:1000], "inline": False})
+                    discord_post("remote", {
+                        "title": "🎯 Remote action",
+                        "color": COLOR_BLUE if final_ok else COLOR_RED,
+                        "fields": fields,
+                    })
+                except Exception as e:
+                    log.warning(f"Discord remote notification failed: {e}")
                 return self._send_json(200, {
                     "job_id": jid,
-                    "ok": row["status"] == "done" and (result.get("ok", True) if isinstance(result, dict) else True),
+                    "ok": final_ok,
                     "result": result,
                 })
             time.sleep(0.1)
@@ -575,6 +875,30 @@ f.addEventListener('submit', async e => {
             c.commit()
         log.info(f"  -> Job {jid[:8]} queued for {machine_id}: '{display_name}' "
                  f"({len(saved)} files, {len(library_adds)} library_adds)")
+        # Discord: upload received
+        try:
+            with db_lock, db() as c:
+                ag = c.execute("SELECT name FROM agents WHERE machine_id=?", (machine_id,)).fetchone()
+            mac_label = ag["name"] if ag else machine_id
+            file_summary = ", ".join(saved[:8]) + (f" (+{len(saved)-8} more)" if len(saved) > 8 else "")
+            adds_summary = ", ".join(library_adds[:8]) + (f" (+{len(library_adds)-8} more)" if len(library_adds) > 8 else "")
+            fields = [
+                {"name": "From", "value": client_ip(self), "inline": True},
+                {"name": "To", "value": mac_label, "inline": True},
+                {"name": "Status", "value": "📥 Received, queued", "inline": True},
+                {"name": "Presentation", "value": display_name[:200], "inline": False},
+            ]
+            if saved:
+                fields.append({"name": f"New files ({len(saved)})", "value": file_summary[:1000] or "—", "inline": False})
+            if library_adds:
+                fields.append({"name": f"Adding existing ({len(library_adds)})", "value": adds_summary[:1000], "inline": False})
+            discord_post("uploads", {
+                "title": "📤 Upload received",
+                "color": COLOR_GRAY,
+                "fields": fields,
+            })
+        except Exception as e:
+            log.warning(f"Discord upload-received notification failed: {e}")
         return self._send_json(200, {"job_id": jid, "status": "queued"})
 
 
