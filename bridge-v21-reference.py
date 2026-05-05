@@ -126,7 +126,27 @@ def delete_presentation(raw):
     if os.path.isdir(assets): shutil.rmtree(assets); print("  deleted assets")
 
 def normalize_v21_item(it):
-    """Ensure an item from GET response has all fields needed for PUT."""
+    """Ensure an item from GET response has all fields needed for PUT.
+    Headers and presentations have DIFFERENT required fields:
+      - presentation items have presentation_info + target_uuid
+      - header items have header_color and target_uuid="" (no presentation_info)
+    Mixing these up makes ProPresenter reject the PUT with HTTP 400."""
+    item_type = it.get("type", "presentation")
+    if "destination" not in it:
+        it["destination"] = "presentation"
+
+    if item_type == "header":
+        # Header items must NOT have presentation_info. target_uuid is empty.
+        if "target_uuid" not in it:
+            it["target_uuid"] = ""
+        # Strip presentation_info if some earlier round of normalization left one in
+        it.pop("presentation_info", None)
+        # header_color should be present from GET; if missing, default to ProPresenter's orange
+        if "header_color" not in it:
+            it["header_color"] = {"red": 1.0, "green": 0.149, "blue": 0.0, "alpha": 1.0}
+        return it
+
+    # Presentation item (default)
     info = it.get("presentation_info", {}) or {}
     pres_uuid = info.get("presentation_uuid", "")
     if "target_uuid" not in it:
@@ -138,8 +158,6 @@ def normalize_v21_item(it):
     if "arrangement_name" not in info:
         info["arrangement_name"] = ""
     it["presentation_info"] = info
-    if "destination" not in it:
-        it["destination"] = "presentation"
     return it
 
 def build_v21_playlist_item(pres_uuid, fallback_name, index):
