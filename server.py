@@ -176,6 +176,16 @@ class H(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204); self._cors(); self.end_headers()
 
+    def do_HEAD(self):
+        # UptimeRobot's free tier uses HEAD requests. Treat HEAD as a cheap
+        # liveness check — return 200 with no body (RFC 7231 §4.3.2).
+        # This keeps Render's free-tier service warm without doing any DB work.
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
