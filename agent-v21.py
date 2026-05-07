@@ -223,6 +223,7 @@ CONTROL_COMMANDS = {
     "delete_from_min":  lambda a: ["delete_from_min", a[0]],
     "reorder_min":      lambda a: ["reorder_min", a[0]],
     "get_thumbnails_bulk": lambda a: ["get_thumbnails_bulk", a[0]],
+    "get_active_thumbnail": lambda a: ["get_active_thumbnail"],
 }
 
 def run_control_job(cmd, args):
