@@ -430,6 +430,56 @@ def get_thumbnails_bulk(pres_uuid):
             out[str(cue)] = b64
     _emit({"ok": True, "presentation_uuid": pres_uuid, "count": total, "thumbnails": out})
 
+def get_active_thumbnail():
+    """Return a base64 thumbnail of whatever slide is currently live in PP.
+    Used by the floating program-feed panel in /control to show what's on screen.
+    Resilient: if nothing is active (no presentation loaded, screen cleared),
+    returns ok=true with active=false so the UI can show 'No active slide'.
+    """
+    import base64
+    try:
+        # PP v21: /presentation/slide_index returns the active slide info
+        # Shape: {"presentation_index": {"index": N, "presentation_id": {"uuid": "..."}}}
+        info = api("GET", "/presentation/slide_index")
+    except Exception as e:
+        _emit({"ok": True, "active": False, "reason": f"no_active_slide ({e})"})
+        return
+
+    if not info:
+        _emit({"ok": True, "active": False, "reason": "no_response"})
+        return
+
+    pidx = info.get("presentation_index") or {}
+    cue = pidx.get("index")
+    pres_id = (pidx.get("presentation_id") or {}).get("uuid")
+
+    if cue is None or pres_id is None:
+        _emit({"ok": True, "active": False, "reason": "nothing_live"})
+        return
+
+    # Fetch the thumbnail for that cue
+    try:
+        data = api_raw(f"/presentation/{pres_id}/thumbnail/{cue}")
+        b64 = base64.b64encode(data).decode("ascii")
+        # Also return the presentation name for the UI label, if we can get it.
+        pres_name = ""
+        try:
+            p = api("GET", f"/presentation/{pres_id}")
+            if p:
+                pres_name = (p.get("presentation", {}) or {}).get("name", "") or ""
+        except Exception:
+            pass
+        _emit({
+            "ok": True,
+            "active": True,
+            "presentation_uuid": pres_id,
+            "presentation_name": pres_name,
+            "cue_index": cue,
+            "thumbnail_b64": b64,
+        })
+    except Exception as e:
+        _emit({"ok": True, "active": False, "reason": f"thumbnail_fetch_failed ({e})"})
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: bridge.py <command> [args]")
@@ -441,6 +491,7 @@ if __name__ == "__main__":
         print("             reorder_min <uuid1,uuid2,...>")
         print("             get_thumbnail <pres_uuid> <cue_index> <output_path>")
         print("             get_thumbnails_bulk <pres_uuid>")
+        print("             get_active_thumbnail")
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "create":
@@ -478,4 +529,6 @@ if __name__ == "__main__":
     elif cmd == "get_thumbnails_bulk":
         if len(sys.argv) < 3: print("Usage: bridge.py get_thumbnails_bulk <pres_uuid>"); sys.exit(1)
         get_thumbnails_bulk(sys.argv[2])
+    elif cmd == "get_active_thumbnail":
+        get_active_thumbnail()
     else: print(f"Unknown: {cmd}"); sys.exit(1)
