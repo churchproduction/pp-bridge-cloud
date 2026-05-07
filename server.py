@@ -572,6 +572,7 @@ class H(BaseHTTPRequestHandler):
         "list_ministries":   {"args": 0, "max_wait": 10},
         "get_slides":        {"args": 1, "max_wait": 10},
         "get_thumbnails_bulk": {"args": 1, "max_wait": 14},
+        "get_active_thumbnail": {"args": 0, "max_wait": 6},
         # mutations
         "delete_from_min":   {"args": 1, "max_wait": 12},
         "reorder_min":       {"args": 1, "max_wait": 12},
