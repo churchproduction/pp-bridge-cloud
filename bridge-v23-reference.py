@@ -629,12 +629,282 @@ def get_active_thumbnail():
     except Exception as e:
         _emit({"ok": True, "active": False, "reason": f"thumbnail_fetch_failed ({e})"})
 
+# =============================================================================
+# SYNC COMMANDS — for cross-Mac presentation copying with theme adaptation
+# =============================================================================
+
+def find_pres_by_uuid(pres_uuid):
+    """Find a .pro file in any library by presentation UUID. Returns (path, parsed_pres) or (None, None)."""
+    if not os.path.isdir(LIBRARY_DIR): return None, None
+    Presentation = find_msg("Presentation")
+    target = pres_uuid.upper()
+    for sub in os.listdir(LIBRARY_DIR):
+        sub_dir = os.path.join(LIBRARY_DIR, sub)
+        if not os.path.isdir(sub_dir): continue
+        for fname in os.listdir(sub_dir):
+            if not fname.endswith(".pro"): continue
+            full = os.path.join(sub_dir, fname)
+            try:
+                pres = Presentation()
+                with open(full, "rb") as f: pres.ParseFromString(f.read())
+                if pres.uuid.string.upper() == target:
+                    return full, pres
+            except Exception: continue
+    return None, None
+
+def read_pres_for_sync(pres_uuid):
+    """Extract the syncable structure from a .pro file: name, group structure,
+    and per-slide RTF lyrics. Emits JSON for the cloud to forward to the destination Mac."""
+    path, pres = find_pres_by_uuid(pres_uuid)
+    if not pres:
+        _emit({"ok": False, "error": f"presentation {pres_uuid} not found"})
+        return
+
+    # Build a list of cues with their RTF text
+    cue_data = {}  # cue_uuid -> {rtf, label}
+    for cue in pres.cues:
+        if not cue.actions: continue
+        a = cue.actions[0]
+        if not a.HasField("slide") or not a.slide.HasField("presentation"): continue
+        bs = a.slide.presentation.base_slide
+        rtf = ""
+        if bs.elements:
+            el = bs.elements[0].element
+            if el.HasField("text"):
+                rtf = el.text.rtf_data
+        cue_data[cue.uuid.string] = {
+            "rtf": rtf,
+            "label": a.label.text or "",
+        }
+
+    # Walk groups to preserve order + group names
+    slides_ordered = []
+    for cg in pres.cue_groups:
+        group_name = cg.group.name or ""
+        for cid in cg.cue_identifiers:
+            cd = cue_data.get(cid.string)
+            if cd is None: continue
+            slides_ordered.append({
+                "group_name": group_name,
+                "rtf": cd["rtf"],
+                "label": cd["label"],
+            })
+
+    _emit({
+        "ok": True,
+        "name": pres.name,
+        "source_size": {"width": pres.cues[0].actions[0].slide.presentation.base_slide.size.width if pres.cues else 1920,
+                        "height": pres.cues[0].actions[0].slide.presentation.base_slide.size.height if pres.cues else 1080},
+        "slides": slides_ordered,
+    })
+
+def _find_template_pres():
+    """Find any .pro file in this Mac's library that has text-bearing slides — use it as
+    a styling template. Returns (template_element_bytes, template_size) or (None, default).
+    We just clone the first text element we find verbatim — fonts, colors, bounds, scroller."""
+    Presentation = find_msg("Presentation")
+    if not os.path.isdir(LIBRARY_DIR): return None, (1920, 1080)
+    for sub in os.listdir(LIBRARY_DIR):
+        sub_dir = os.path.join(LIBRARY_DIR, sub)
+        if not os.path.isdir(sub_dir): continue
+        for fname in sorted(os.listdir(sub_dir)):
+            if not fname.endswith(".pro"): continue
+            full = os.path.join(sub_dir, fname)
+            try:
+                pres = Presentation()
+                with open(full, "rb") as f: pres.ParseFromString(f.read())
+            except Exception: continue
+            for cue in pres.cues:
+                if not cue.actions: continue
+                a = cue.actions[0]
+                if not a.HasField("slide") or not a.slide.HasField("presentation"): continue
+                bs = a.slide.presentation.base_slide
+                if not bs.elements: continue
+                el_wrapper = bs.elements[0]
+                if not el_wrapper.element.HasField("text"): continue
+                # Found a usable template. Serialize the wrapper so we can clone it later.
+                template_bytes = el_wrapper.SerializeToString()
+                size = (bs.size.width or 1920, bs.size.height or 1080)
+                return template_bytes, size
+    return None, (1920, 720)
+
+def _replace_rtf_text(rtf, new_text):
+    """Replace the lyric body inside an RTF blob. Preserves all the formatting codes
+    at the top (font, color, paragraph style, font size). The actual text starts after
+    the last \\cf marker like '\\cf2 ' and runs to the closing brace."""
+    if not rtf or not new_text:
+        return rtf
+    # Find the last "\cfN " marker — that's where text content starts
+    m = re.search(r'(\\cf\d+\s)', rtf)
+    if not m:
+        return rtf  # unfamiliar RTF shape — bail and keep original
+    head = rtf[:m.end()]
+    # Find the matching closing brace at the end
+    # RTF body ends with the final '}' that closes the document
+    tail_match = re.search(r'\}\s*$', rtf)
+    tail = rtf[tail_match.start():] if tail_match else "}"
+    # Escape backslashes and braces in the new text per RTF rules, then convert newlines
+    escaped = new_text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    escaped = escaped.replace("\n", "\\\n")
+    return head + escaped + tail
+
+def _extract_text_from_rtf(rtf):
+    """Pull plain text out of an RTF blob — used for fallback if the source RTF is empty."""
+    if not rtf: return ""
+    # Strip the {\rtf1...} header
+    body = re.sub(r'^\{\\rtf1[^}]*\}', '', rtf)
+    # Strip {\fonttbl...} and {\colortbl...} groups
+    body = re.sub(r'\{\\\w+[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', '', body)
+    # Strip remaining \commandN words
+    body = re.sub(r'\\[a-zA-Z]+-?\d*\s?', '', body)
+    # Strip single \ followed by symbol
+    body = re.sub(r'\\[^a-zA-Z]', '', body)
+    # Drop remaining braces
+    body = body.replace("{", "").replace("}", "")
+    return body.strip()
+
+def sync_pres_to_playlist(name, playlist_uuid, slides_json):
+    """Build a new presentation on THIS Mac using the slides_json from the source Mac,
+    styled with this Mac's template (font, bounds, theme size). Then add to the named playlist.
+
+    slides_json format: JSON array of {"group_name": "...", "rtf": "...", "label": "..."}
+    Pulled from `read_pres_for_sync` on the source Mac.
+    """
+    library = get_library_dir()
+    if not library:
+        _emit({"ok": False, "error": "no library"}); return
+
+    try:
+        slides = json.loads(slides_json)
+    except Exception as e:
+        _emit({"ok": False, "error": f"bad slides_json: {e}"}); return
+    if not isinstance(slides, list) or not slides:
+        _emit({"ok": False, "error": "slides_json is empty or not a list"}); return
+
+    # Find a unique name on this Mac. If "Holy Forever" exists, use "Holy Forever 2" etc.
+    base_name = sanitize_name(name)
+    final_name = base_name
+    n = 2
+    while os.path.exists(os.path.join(library, f"{final_name}.pro")):
+        final_name = f"{base_name} {n}"
+        n += 1
+        if n > 50: break  # safety
+
+    # Pull our local template — gives us this Mac's font / bounds / size / scroller
+    template_bytes, (tw, th) = _find_template_pres()
+    if template_bytes is None:
+        _emit({"ok": False, "error": "no template presentation on this Mac to style from — need at least one text song in the library"}); return
+
+    Presentation                   = find_msg("Presentation")
+    PLATFORM_MACOS                 = find_enum("PLATFORM_MACOS")
+    APPLICATION_PROPRESENTER       = find_enum("APPLICATION_PROPRESENTER")
+    ACTION_TYPE_PRESENTATION_SLIDE = find_enum("ACTION_TYPE_PRESENTATION_SLIDE")
+    COMPLETION_ACTION_TYPE_LAST    = find_enum("COMPLETION_ACTION_TYPE_LAST")
+
+    pres = Presentation()
+    ai = pres.application_info
+    ai.platform = PLATFORM_MACOS
+    ai.platform_version.major_version = 26
+    ai.platform_version.minor_version = 2
+    ai.application = APPLICATION_PROPRESENTER
+    ai.application_version.major_version = 21
+    ai.application_version.patch_version = 1
+    ai.application_version.build = "318767361"
+    pres.uuid.string = uid()
+    pres.name = final_name
+    pres.chord_chart.platform = PLATFORM_MACOS
+
+    # Build groups, preserving order. Consecutive slides with the same group_name go in the same group.
+    # Empty group_name = an unnamed group (PP shows these as ungrouped).
+    cue_uuids_by_group = []  # list of (group_name, [cue_uuids])
+    for s in slides:
+        gn = s.get("group_name", "") or ""
+        if cue_uuids_by_group and cue_uuids_by_group[-1][0] == gn:
+            cue_uuids_by_group[-1][1].append(uid())
+        else:
+            cue_uuids_by_group.append((gn, [uid()]))
+
+    # Flatten cue_uuids in order
+    flat_cue_uuids = [u for _, group_uuids in cue_uuids_by_group for u in group_uuids]
+
+    # Add cue_groups
+    for group_name, cue_uuids in cue_uuids_by_group:
+        cg = pres.cue_groups.add()
+        cg.group.uuid.string = uid()
+        cg.group.name = group_name
+        for cu in cue_uuids:
+            cg.cue_identifiers.add().string = cu
+
+    # We need a scratch "Element wrapper" message to deserialize the template into.
+    # The base_slide.elements field is a repeated submessage — we get the type via the descriptor.
+    template_pres = Presentation()
+    template_cue = template_pres.cues.add()
+    template_action = template_cue.actions.add()
+    template_action.type = ACTION_TYPE_PRESENTATION_SLIDE
+    ElementWrapperType = template_action.slide.presentation.base_slide.elements.add().__class__
+
+    # Build cues. For each slide, copy the template element wrapper and swap in our RTF text.
+    for cue_uuid, slide_data in zip(flat_cue_uuids, slides):
+        cue = pres.cues.add()
+        cue.uuid.string = cue_uuid
+        cue.completion_action_type = COMPLETION_ACTION_TYPE_LAST
+        cue.isEnabled = True
+        action = cue.actions.add()
+        action.uuid.string = uid()
+        action.label.text = slide_data.get("label", "") or ""
+        action.isEnabled = True
+        action.type = ACTION_TYPE_PRESENTATION_SLIDE
+
+        bs = action.slide.presentation.base_slide
+        bs.uuid.string = uid()
+        bs.size.width = tw
+        bs.size.height = th
+        action.slide.presentation.chord_chart.platform = PLATFORM_MACOS
+
+        # Clone the template element wrapper and swap in the source's lyrics
+        new_wrapper = bs.elements.add()
+        new_wrapper.ParseFromString(template_bytes)
+        # Fresh UUID for the element so it doesn't collide
+        new_wrapper.element.uuid.string = uid()
+        # Inject the source's RTF text into the cloned element's text field
+        if new_wrapper.element.HasField("text"):
+            src_rtf = slide_data.get("rtf", "") or ""
+            if src_rtf:
+                # Use the cloned element's RTF (this Mac's font + styling) and swap in
+                # just the lyric text from the source RTF
+                src_text = _extract_text_from_rtf(src_rtf)
+                if src_text:
+                    new_wrapper.element.text.rtf_data = _replace_rtf_text(
+                        new_wrapper.element.text.rtf_data, src_text)
+
+    # Serialize and save
+    out = os.path.join(library, f"{final_name}.pro")
+    with open(out, "wb") as f: f.write(pres.SerializeToString())
+
+    # Add to playlist
+    time.sleep(1.5)
+    pl = api("GET", f"/playlist/{playlist_uuid}")
+    items = [normalize_v21_item(it) for it in (pl.get("items", []) if pl else [])]
+    items.append(build_v21_playlist_item(pres.uuid.string, final_name, len(items)))
+    api("PUT", f"/playlist/{playlist_uuid}", items)
+
+    _emit({
+        "ok": True,
+        "created_name": final_name,
+        "renamed": final_name != base_name,
+        "presentation_uuid": pres.uuid.string,
+        "slides_count": len(slides),
+    })
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: bridge.py <command> [args]")
         print("  Content (legacy):  create <name> <folder> | delete <name> | add_existing <name>")
         print("  Content (multi):   create_in_playlist <name> <folder> <playlist_uuid>")
         print("                     add_existing_to_playlist <name> <playlist_uuid>")
+        print("  Sync:              read_pres_for_sync <pres_uuid>")
+        print("                     sync_pres_to_playlist <name> <playlist_uuid> <slides_json>")
         print("  Read:              list_playlists | list_ministries | list_playlist_items <playlist_uuid>")
         print("                     get_slides <pres_uuid>")
         print("                     get_thumbnail <pres_uuid> <cue_index> <output_path>")
@@ -706,4 +976,10 @@ if __name__ == "__main__":
         get_thumbnails_bulk(sys.argv[2])
     elif cmd == "get_active_thumbnail":
         get_active_thumbnail()
+    elif cmd == "read_pres_for_sync":
+        if len(sys.argv) < 3: print("Usage: bridge.py read_pres_for_sync <pres_uuid>"); sys.exit(1)
+        read_pres_for_sync(sys.argv[2])
+    elif cmd == "sync_pres_to_playlist":
+        if len(sys.argv) < 5: print("Usage: bridge.py sync_pres_to_playlist <name> <playlist_uuid> <slides_json>"); sys.exit(1)
+        sync_pres_to_playlist(sys.argv[2], sys.argv[3], sys.argv[4])
     else: print(f"Unknown: {cmd}"); sys.exit(1)
