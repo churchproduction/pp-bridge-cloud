@@ -708,10 +708,16 @@ def read_pres_for_sync(pres_uuid):
 
 def _find_template_pres():
     """Find any .pro file in this Mac's library that has text-bearing slides — use it as
-    a styling template. Returns (template_element_bytes, template_size) or (None, default).
-    We just clone the first text element we find verbatim — fonts, colors, bounds, scroller."""
+    a styling template. Returns (template_element_bytes, template_size, caps_mode) or
+    (None, default, "none").
+    caps_mode is "upper" if the template applies CAPITALIZATION_ALL_CAPS, else "none"."""
     Presentation = find_msg("Presentation")
-    if not os.path.isdir(LIBRARY_DIR): return None, (1920, 1080)
+    if not os.path.isdir(LIBRARY_DIR): return None, (1920, 1080), "none"
+    # Look up the enum value for ALL_CAPS once
+    try:
+        ALL_CAPS = find_enum("CAPITALIZATION_ALL_CAPS")
+    except Exception:
+        ALL_CAPS = None
     for sub in os.listdir(LIBRARY_DIR):
         sub_dir = os.path.join(LIBRARY_DIR, sub)
         if not os.path.isdir(sub_dir): continue
@@ -730,11 +736,18 @@ def _find_template_pres():
                 if not bs.elements: continue
                 el_wrapper = bs.elements[0]
                 if not el_wrapper.element.HasField("text"): continue
-                # Found a usable template. Serialize the wrapper so we can clone it later.
+                # Found a usable template. Detect capitalization mode from text.attributes.capitalization.
+                caps_mode = "none"
+                try:
+                    cap = el_wrapper.element.text.attributes.capitalization
+                    if ALL_CAPS is not None and cap == ALL_CAPS:
+                        caps_mode = "upper"
+                except Exception:
+                    pass
                 template_bytes = el_wrapper.SerializeToString()
                 size = (bs.size.width or 1920, bs.size.height or 1080)
-                return template_bytes, size
-    return None, (1920, 720)
+                return template_bytes, size, caps_mode
+    return None, (1920, 720), "none"
 
 def _replace_rtf_text(rtf, new_text):
     """Replace the lyric body inside an RTF blob. Preserves all the formatting codes
@@ -876,8 +889,8 @@ def sync_pres_to_playlist(name, playlist_uuid, slides_json):
         n += 1
         if n > 50: break  # safety
 
-    # Pull our local template — gives us this Mac's font / bounds / size / scroller
-    template_bytes, (tw, th) = _find_template_pres()
+    # Pull our local template — gives us this Mac's font / bounds / size / scroller / caps mode
+    template_bytes, (tw, th), caps_mode = _find_template_pres()
     if template_bytes is None:
         _emit({"ok": False, "error": "no template presentation on this Mac to style from — need at least one text song in the library"}); return
 
@@ -967,6 +980,12 @@ def sync_pres_to_playlist(name, playlist_uuid, slides_json):
                 # just the lyric text from the source RTF
                 src_text = _extract_text_from_rtf(src_rtf)
                 if src_text:
+                    # Match the destination template's capitalization. ProPresenter's
+                    # CAPITALIZATION_ALL_CAPS protobuf flag only renders existing
+                    # uppercase characters as caps — anything typed lowercase stays
+                    # lowercase. So we manually uppercase here when the template asks for it.
+                    if caps_mode == "upper":
+                        src_text = src_text.upper()
                     new_rtf = _replace_rtf_text(tmpl_rtf, src_text)
                     # rtf_data field is `bytes` in protobuf — encode back
                     new_wrapper.element.text.rtf_data = new_rtf.encode("utf-8") if isinstance(new_rtf, str) else new_rtf
