@@ -616,6 +616,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send_json(423, {"error": "service_lockout",
                     "message": "Uploads are locked during Sunday service hours."})
             return self._submit_job()
+        if u.path == "/api/sync_presentation":
+            if is_request_blocked(self.headers):
+                return self._send_json(423, {"error": "service_lockout",
+                    "message": "Sync is locked during Sunday service hours."})
+            return self._sync_presentation()
         if u.path == "/api/gate-event":
             # Frontend reports a gate password attempt (success or fail).
             # Body: {"success": true|false, "page": "control"|"index", "attempt_hash": "<sha256>"}
@@ -671,6 +676,9 @@ class H(BaseHTTPRequestHandler):
         "trigger_next":         {"args": 0, "max_wait": 6},
         "trigger_previous":     {"args": 0, "max_wait": 6},
         "clear_slide":          {"args": 0, "max_wait": 6},
+        # Cross-Mac sync (Production GUI)
+        "read_pres_for_sync":   {"args": 1, "max_wait": 10},
+        "sync_pres_to_playlist":{"args": 3, "max_wait": 25},
     }
 
     def _control_submit(self):
@@ -807,7 +815,106 @@ class H(BaseHTTPRequestHandler):
             c.commit()
         return self._send_json(200, {"ok": True})
 
-    def _upload_form(self):
+    def _sync_presentation(self):
+        """Orchestrate a cross-Mac sync. Body:
+        {
+          "source_machine_id": "building-c-side-screens",
+          "source_pres_uuid": "DB956B6B-...",
+          "source_name": "Build My Life",  // for display
+          "dest_machine_id": "building-c-led-wall",
+          "dest_playlist_uuid": "A42AF03D-..."
+        }
+        Returns the result of the destination's sync_pres_to_playlist call.
+        """
+        b = self._read_json()
+        src_mid = (b.get("source_machine_id") or "").strip()
+        src_pres = (b.get("source_pres_uuid") or "").strip()
+        src_name = (b.get("source_name") or "Untitled").strip()
+        dest_mid = (b.get("dest_machine_id") or "").strip()
+        dest_pl = (b.get("dest_playlist_uuid") or "").strip()
+        if not (src_mid and src_pres and dest_mid and dest_pl):
+            return self._send_json(400, {"error": "need source_machine_id, source_pres_uuid, dest_machine_id, dest_playlist_uuid"})
+        # Validate the destination playlist is whitelisted for the destination Mac
+        if not is_playlist_allowed(dest_mid, dest_pl):
+            return self._send_json(403, {"error": f"playlist {dest_pl} not allowed for machine {dest_mid}"})
+        # Verify both agents exist + online
+        with db_lock, db() as c:
+            src_ag = c.execute("SELECT * FROM agents WHERE machine_id=?", (src_mid,)).fetchone()
+            dest_ag = c.execute("SELECT * FROM agents WHERE machine_id=?", (dest_mid,)).fetchone()
+        if not src_ag: return self._send_json(404, {"error": f"unknown source machine {src_mid}"})
+        if not dest_ag: return self._send_json(404, {"error": f"unknown dest machine {dest_mid}"})
+        if not is_online_row(src_ag): return self._send_json(503, {"error": "source machine offline"})
+        if not is_online_row(dest_ag): return self._send_json(503, {"error": "destination machine offline"})
+
+        # Step 1: ask source Mac to read the presentation structure
+        read_result = self._run_control_sync(src_mid, "read_pres_for_sync", [src_pres], 12)
+        if not read_result or not read_result.get("ok"):
+            err = (read_result or {}).get("error", "source read failed")
+            return self._send_json(500, {"error": f"source read failed: {err}"})
+        slides = read_result.get("slides", [])
+        if not slides:
+            return self._send_json(500, {"error": "source presentation has no slides to sync"})
+        canonical_name = read_result.get("name") or src_name
+
+        # Step 2: ask destination Mac to build the new presentation
+        slides_json = json.dumps(slides)
+        # Guard against very large payloads (RTF can be heavy)
+        if len(slides_json) > 800000:
+            return self._send_json(500, {"error": f"slides payload too large ({len(slides_json)} bytes)"})
+        build_result = self._run_control_sync(dest_mid, "sync_pres_to_playlist",
+                                              [canonical_name, dest_pl, slides_json], 25)
+        if not build_result or not build_result.get("ok"):
+            err = (build_result or {}).get("error", "destination build failed")
+            return self._send_json(500, {"error": f"destination build failed: {err}"})
+
+        # Discord notification — sync events go to #remote
+        try:
+            discord_post("remote", {
+                "title": "🔁 Sync completed",
+                "color": COLOR_BLUE,
+                "fields": [
+                    {"name": "From", "value": src_ag["name"] if src_ag else src_mid, "inline": True},
+                    {"name": "To", "value": dest_ag["name"] if dest_ag else dest_mid, "inline": True},
+                    {"name": "Source", "value": canonical_name, "inline": False},
+                    {"name": "Created", "value": build_result.get("created_name", "?") +
+                        (" (renamed)" if build_result.get("renamed") else ""), "inline": True},
+                    {"name": "Slides", "value": str(build_result.get("slides_count", "?")), "inline": True},
+                ],
+            })
+        except Exception:
+            pass
+
+        return self._send_json(200, {
+            "ok": True,
+            "source_name": canonical_name,
+            "created_name": build_result.get("created_name"),
+            "renamed": build_result.get("renamed", False),
+            "slides_count": build_result.get("slides_count"),
+        })
+
+    def _run_control_sync(self, machine_id, command, args, max_wait):
+        """Helper: enqueue a control job and synchronously wait for the agent's result.
+        Used by _sync_presentation to chain multiple agent calls. Returns the result dict
+        (or None on timeout/failure)."""
+        jid = uuid.uuid4().hex
+        ts = now()
+        with db_lock, db() as c:
+            c.execute("INSERT INTO control_jobs(job_id, machine_id, command, args_json, status, "
+                      "result_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                      (jid, machine_id, command, json.dumps(args), "queued", "", ts, ts))
+            c.commit()
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            with db_lock, db() as c:
+                row = c.execute("SELECT status, result_json FROM control_jobs WHERE job_id=?",
+                                (jid,)).fetchone()
+            if row and row["status"] in ("done", "failed"):
+                try:
+                    return json.loads(row["result_json"]) if row["result_json"] else None
+                except Exception:
+                    return {"ok": False, "error": "malformed result"}
+            time.sleep(0.15)
+        return {"ok": False, "error": f"timeout after {max_wait}s"}
         agents_json = "[]"
         try:
             with db_lock, db() as c:
