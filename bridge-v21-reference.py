@@ -303,6 +303,31 @@ def create_presentation(raw, folder):
 def _emit(obj):
     print(json.dumps(obj))
 
+def list_playlists():
+    """Emit all playlists on this Mac as JSON.
+
+    Phase 1 of multi-playlist support. Returns top-level playlists, with a
+    note for any playlist folders (groups) we encounter so the UI can decide
+    later whether to recurse. The default_uuid field gives the frontend a
+    safe fallback (the current MIN_PLAYLIST_UUID) so existing workflows keep
+    working while the multi-playlist UI is being built.
+    """
+    pls = api("GET", "/playlists")
+    out = []
+    for p in pls or []:
+        ptype = p.get("type", "playlist")
+        pid = p.get("id", {}) or {}
+        entry = {
+            "uuid": pid.get("uuid", ""),
+            "name": pid.get("name", ""),
+            "index": pid.get("index", 0),
+            "type": ptype,
+        }
+        if ptype == "playlistFolder":
+            entry["child_count"] = len(p.get("playlists", []) or [])
+        out.append(entry)
+    _emit({"ok": True, "playlists": out, "default_uuid": MIN_PLAYLIST_UUID})
+
 def list_ministries():
     """Emit Ministries playlist items as JSON list."""
     pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
@@ -484,7 +509,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: bridge.py <command> [args]")
         print("  Content:   create <name> <folder> | delete <name> | add_existing <name>")
-        print("  Remote:    list_ministries | get_slides <pres_uuid>")
+        print("  Remote:    list_playlists | list_ministries | get_slides <pres_uuid>")
         print("             trigger_slide <item_uuid> <cue_index>")
         print("             trigger_next | trigger_previous | clear_slide")
         print("             delete_from_min <item_uuid>")
@@ -503,6 +528,8 @@ if __name__ == "__main__":
     elif cmd == "add_existing":
         if len(sys.argv) < 3: print("Usage: bridge.py add_existing <name>"); sys.exit(1)
         add_existing_to_ministries(sys.argv[2])
+    elif cmd == "list_playlists":
+        list_playlists()
     elif cmd == "list_ministries":
         list_ministries()
     elif cmd == "get_slides":
