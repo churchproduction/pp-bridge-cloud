@@ -110,15 +110,18 @@ def find_in_playlist(plid, name):
             return i, it, items
     return None, None, items
 
-def delete_presentation(raw):
+def delete_presentation(raw, target_playlist=None):
+    """Delete the .pro and asset files for a presentation, AND remove it
+    from the given playlist (defaults to MIN_PLAYLIST_UUID for backward compat)."""
     name = sanitize_name(raw)
+    plid = target_playlist or MIN_PLAYLIST_UUID
     print(f"Deleting '{name}'...")
     library = get_library_dir()
-    idx, item, items = find_in_playlist(MIN_PLAYLIST_UUID, name)
+    idx, item, items = find_in_playlist(plid, name)
     if item is not None:
-        api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}",
+        api("PUT", f"/playlist/{plid}",
             [normalize_v21_item(it) for j, it in enumerate(items) if j != idx])
-        print(f"  removed from Ministries")
+        print(f"  removed from playlist")
     if library:
         pro = os.path.join(library, f"{name}.pro")
         if os.path.exists(pro): os.remove(pro); print("  deleted .pro")
@@ -185,7 +188,23 @@ def build_v21_playlist_item(pres_uuid, fallback_name, index):
         },
     }
 
+def _add_pres_uuid_to_playlist(plid, pres_uuid, fallback_name):
+    """Generic helper — append a presentation to a playlist if not already present.
+    Used by both add_existing_to_ministries and add_existing_to_playlist.
+    Returns (was_added, total_items_in_playlist)."""
+    pl = api("GET", f"/playlist/{plid}")
+    items = [normalize_v21_item(it) for it in (pl.get("items", []) if pl else [])]
+    for it in items:
+        info = it.get("presentation_info", {}) or {}
+        if info.get("presentation_uuid") == pres_uuid:
+            return False, len(items)  # already present
+    items.append(build_v21_playlist_item(pres_uuid, fallback_name, len(items)))
+    api("PUT", f"/playlist/{plid}", items)
+    return True, len(items)
+
 def add_existing_to_ministries(raw_name):
+    """LEGACY — kept for backward compat with current agent.py.
+    New code should use add_existing_to_playlist."""
     pro_path, name = find_pro_in_libraries(raw_name)
     if not pro_path:
         print(f"Not found in any library: '{name}'")
@@ -196,20 +215,34 @@ def add_existing_to_ministries(raw_name):
         pres.ParseFromString(f.read())
     pres_uuid = pres.uuid.string
     print(f"Found '{name}' (uuid={pres_uuid[:8]}...)")
-    pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
-    items = [normalize_v21_item(it) for it in (pl.get("items", []) if pl else [])]
-    for it in items:
-        info = it.get("presentation_info", {}) or {}
-        if info.get("presentation_uuid") == pres_uuid:
-            print(f"Already in Ministries — skipping")
-            return
-    items.append(build_v21_playlist_item(pres_uuid, name, len(items)))
-    api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", items)
-    print(f"Added '{name}' to Ministries (now {len(items)} items)")
+    added, total = _add_pres_uuid_to_playlist(MIN_PLAYLIST_UUID, pres_uuid, name)
+    if not added:
+        print(f"Already in Ministries — skipping")
+    else:
+        print(f"Added '{name}' to Ministries (now {total} items)")
 
-def create_presentation(raw, folder):
-    name = sanitize_name(raw)
-    folder = os.path.expanduser(folder)
+def add_existing_to_playlist(raw_name, playlist_uuid):
+    """Add a library presentation to the named playlist.
+    Used for upload-to-any-playlist routing from the cloud."""
+    pro_path, name = find_pro_in_libraries(raw_name)
+    if not pro_path:
+        print(f"Not found in any library: '{name}'")
+        sys.exit(2)
+    Presentation = find_msg("Presentation")
+    pres = Presentation()
+    with open(pro_path, "rb") as f:
+        pres.ParseFromString(f.read())
+    pres_uuid = pres.uuid.string
+    print(f"Found '{name}' (uuid={pres_uuid[:8]}...)")
+    added, total = _add_pres_uuid_to_playlist(playlist_uuid, pres_uuid, name)
+    if not added:
+        print(f"Already in target playlist — skipping")
+    else:
+        print(f"Added '{name}' to playlist (now {total} items)")
+
+def _build_pro_for_media(name, folder):
+    """Build a .pro file from a folder of media. Returns (pres_uuid, copied_count).
+    Shared by create_presentation and create_in_playlist."""
     library = get_library_dir()
     if not library:
         print(f"No library folder in {LIBRARY_DIR}"); sys.exit(1)
@@ -222,9 +255,7 @@ def create_presentation(raw, folder):
     LAYER_TYPE_FOREGROUND          = find_enum("LAYER_TYPE_FOREGROUND")
     COMPLETION_ACTION_TYPE_LAST    = find_enum("COMPLETION_ACTION_TYPE_LAST")
     ROOT_SHOW                      = find_enum("ROOT_SHOW")
-    pro = os.path.join(library, f"{name}.pro")
-    if os.path.exists(pro):
-        print(f"'{name}' exists — replacing"); delete_presentation(name)
+
     media = sorted([f for f in glob.glob(os.path.join(folder, "*"))
                     if f.lower().endswith(ALL_EXTS)])
     if not media: print(f"No media in {folder}"); sys.exit(1)
@@ -287,13 +318,50 @@ def create_presentation(raw, folder):
     out = os.path.join(library, f"{name}.pro")
     with open(out, "wb") as f: f.write(pres.SerializeToString())
     print(f"      Wrote {out}")
+    return pres.uuid.string, len(copied)
+
+def create_presentation(raw, folder):
+    """LEGACY — creates a presentation and adds it to MIN_PLAYLIST_UUID.
+    Kept for backward compat with current agent.py."""
+    name = sanitize_name(raw)
+    folder = os.path.expanduser(folder)
+    library = get_library_dir()
+    if not library:
+        print(f"No library folder in {LIBRARY_DIR}"); sys.exit(1)
+    pro = os.path.join(library, f"{name}.pro")
+    if os.path.exists(pro):
+        print(f"'{name}' exists — replacing"); delete_presentation(name)
+    pres_uuid, count = _build_pro_for_media(name, folder)
     print(f"[4/4] Adding to Ministries...")
     time.sleep(1.5)
     pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
     items = [normalize_v21_item(it) for it in (pl.get("items", []) if pl else [])]
-    items.append(build_v21_playlist_item(pres.uuid.string, name, len(items)))
+    items.append(build_v21_playlist_item(pres_uuid, name, len(items)))
     api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", items)
-    print(f"\nDone — '{name}' ({len(copied)} slides)\n")
+    print(f"\nDone — '{name}' ({count} slides)\n")
+
+def create_in_playlist(raw, folder, playlist_uuid):
+    """Build a presentation from a folder of media and add it to the named playlist.
+    The .pro file lives in the library (one per name) but the playlist
+    membership is what the agent controls. If a .pro with this name exists,
+    we replace it AND remove it from the target playlist before adding."""
+    name = sanitize_name(raw)
+    folder = os.path.expanduser(folder)
+    library = get_library_dir()
+    if not library:
+        print(f"No library folder in {LIBRARY_DIR}"); sys.exit(1)
+    pro = os.path.join(library, f"{name}.pro")
+    if os.path.exists(pro):
+        print(f"'{name}' exists — replacing")
+        delete_presentation(name, target_playlist=playlist_uuid)
+    pres_uuid, count = _build_pro_for_media(name, folder)
+    print(f"[4/4] Adding to playlist {playlist_uuid[:8]}...")
+    time.sleep(1.5)
+    pl = api("GET", f"/playlist/{playlist_uuid}")
+    items = [normalize_v21_item(it) for it in (pl.get("items", []) if pl else [])]
+    items.append(build_v21_playlist_item(pres_uuid, name, len(items)))
+    api("PUT", f"/playlist/{playlist_uuid}", items)
+    print(f"\nDone — '{name}' ({count} slides)\n")
 
 # =============================================================================
 # REMOTE-CONTROL COMMANDS (added for production GUI)
@@ -304,14 +372,9 @@ def _emit(obj):
     print(json.dumps(obj))
 
 def list_playlists():
-    """Emit all playlists on this Mac as JSON.
-
-    Phase 1 of multi-playlist support. Returns top-level playlists, with a
-    note for any playlist folders (groups) we encounter so the UI can decide
-    later whether to recurse. The default_uuid field gives the frontend a
-    safe fallback (the current MIN_PLAYLIST_UUID) so existing workflows keep
-    working while the multi-playlist UI is being built.
-    """
+    """Emit all top-level playlists on this Mac as JSON.
+    Used by the cloud to validate that a config-defined UUID still exists,
+    and by the frontend dropdown if we ever go fully dynamic."""
     pls = api("GET", "/playlists")
     out = []
     for p in pls or []:
@@ -329,7 +392,9 @@ def list_playlists():
     _emit({"ok": True, "playlists": out, "default_uuid": MIN_PLAYLIST_UUID})
 
 def list_ministries():
-    """Emit Ministries playlist items as JSON list."""
+    """LEGACY: emit Ministries playlist items as JSON list.
+    Kept so the current control.html keeps working while the
+    multi-playlist UI rolls out. New code should use list_playlist_items."""
     pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
     items = pl.get("items", []) if pl else []
     out = []
@@ -343,6 +408,22 @@ def list_ministries():
             "is_hidden": it.get("is_hidden", False),
         })
     _emit({"ok": True, "playlist_uuid": MIN_PLAYLIST_UUID, "items": out})
+
+def list_playlist_items(playlist_uuid):
+    """Emit items of any playlist as JSON list (generic version of list_ministries)."""
+    pl = api("GET", f"/playlist/{playlist_uuid}")
+    items = pl.get("items", []) if pl else []
+    out = []
+    for it in items:
+        info = it.get("presentation_info", {}) or {}
+        out.append({
+            "item_uuid": it.get("id", {}).get("uuid", ""),
+            "name": it.get("id", {}).get("name", ""),
+            "type": it.get("type", "presentation"),
+            "presentation_uuid": info.get("presentation_uuid", ""),
+            "is_hidden": it.get("is_hidden", False),
+        })
+    _emit({"ok": True, "playlist_uuid": playlist_uuid, "items": out})
 
 def get_slides(pres_uuid):
     """Emit slides of a presentation as JSON, with flat cue indices."""
@@ -372,10 +453,17 @@ def get_slides(pres_uuid):
     })
 
 def trigger_slide(item_uuid, cue_index):
-    """Trigger a slide via playlist path: /playlist/<min>/<item>/<cue>/trigger."""
+    """LEGACY: trigger via Ministries playlist.
+    New code should use trigger_slide_pl."""
     cue = int(cue_index)
     api("GET", f"/playlist/{MIN_PLAYLIST_UUID}/{item_uuid}/{cue}/trigger")
     _emit({"ok": True, "item_uuid": item_uuid, "cue": cue})
+
+def trigger_slide_pl(playlist_uuid, item_uuid, cue_index):
+    """Trigger a slide via any playlist."""
+    cue = int(cue_index)
+    api("GET", f"/playlist/{playlist_uuid}/{item_uuid}/{cue}/trigger")
+    _emit({"ok": True, "playlist_uuid": playlist_uuid, "item_uuid": item_uuid, "cue": cue})
 
 def trigger_next():
     api("GET", "/trigger/next")
@@ -390,7 +478,8 @@ def clear_slide():
     _emit({"ok": True, "action": "clear"})
 
 def delete_from_ministries(item_uuid):
-    """Remove a single playlist item by item_uuid. Does NOT delete the .pro."""
+    """LEGACY: remove a single playlist item from Ministries by item_uuid.
+    New code should use delete_from_pl."""
     pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
     items = pl.get("items", []) if pl else []
     new_items, removed_name = [], None
@@ -405,8 +494,25 @@ def delete_from_ministries(item_uuid):
     api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", new_items)
     _emit({"ok": True, "removed": removed_name, "remaining": len(new_items)})
 
+def delete_from_pl(playlist_uuid, item_uuid):
+    """Remove an item from any playlist by item_uuid. Does NOT delete the .pro."""
+    pl = api("GET", f"/playlist/{playlist_uuid}")
+    items = pl.get("items", []) if pl else []
+    new_items, removed_name = [], None
+    for it in items:
+        if it.get("id", {}).get("uuid") == item_uuid:
+            removed_name = it.get("id", {}).get("name", "")
+            continue
+        new_items.append(normalize_v21_item(it))
+    if removed_name is None:
+        _emit({"ok": False, "error": "item_uuid not found in playlist"})
+        sys.exit(2)
+    api("PUT", f"/playlist/{playlist_uuid}", new_items)
+    _emit({"ok": True, "removed": removed_name, "remaining": len(new_items)})
+
 def reorder_ministries(item_uuids_csv):
-    """Reorder Ministries by comma-separated item UUIDs. Must be a perfect permutation."""
+    """LEGACY: reorder Ministries by comma-separated item UUIDs.
+    New code should use reorder_pl."""
     new_order = [u.strip() for u in item_uuids_csv.split(",") if u.strip()]
     pl = api("GET", f"/playlist/{MIN_PLAYLIST_UUID}")
     items = pl.get("items", []) if pl else []
@@ -421,6 +527,24 @@ def reorder_ministries(item_uuids_csv):
         sys.exit(2)
     new_items = [normalize_v21_item(by_uuid[u]) for u in new_order]
     api("PUT", f"/playlist/{MIN_PLAYLIST_UUID}", new_items)
+    _emit({"ok": True, "reordered": len(new_items)})
+
+def reorder_pl(playlist_uuid, item_uuids_csv):
+    """Reorder any playlist by comma-separated item UUIDs. Must be a perfect permutation."""
+    new_order = [u.strip() for u in item_uuids_csv.split(",") if u.strip()]
+    pl = api("GET", f"/playlist/{playlist_uuid}")
+    items = pl.get("items", []) if pl else []
+    by_uuid = {it.get("id", {}).get("uuid", ""): it for it in items}
+    if set(new_order) != set(by_uuid.keys()):
+        _emit({
+            "ok": False,
+            "error": "uuids must be a permutation of current items",
+            "missing": list(set(by_uuid.keys()) - set(new_order)),
+            "extra": list(set(new_order) - set(by_uuid.keys())),
+        })
+        sys.exit(2)
+    new_items = [normalize_v21_item(by_uuid[u]) for u in new_order]
+    api("PUT", f"/playlist/{playlist_uuid}", new_items)
     _emit({"ok": True, "reordered": len(new_items)})
 
 def get_thumbnail(pres_uuid, cue_index, output_path):
@@ -508,36 +632,54 @@ def get_active_thumbnail():
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: bridge.py <command> [args]")
-        print("  Content:   create <name> <folder> | delete <name> | add_existing <name>")
-        print("  Remote:    list_playlists | list_ministries | get_slides <pres_uuid>")
-        print("             trigger_slide <item_uuid> <cue_index>")
-        print("             trigger_next | trigger_previous | clear_slide")
-        print("             delete_from_min <item_uuid>")
-        print("             reorder_min <uuid1,uuid2,...>")
-        print("             get_thumbnail <pres_uuid> <cue_index> <output_path>")
-        print("             get_thumbnails_bulk <pres_uuid>")
-        print("             get_active_thumbnail")
+        print("  Content (legacy):  create <name> <folder> | delete <name> | add_existing <name>")
+        print("  Content (multi):   create_in_playlist <name> <folder> <playlist_uuid>")
+        print("                     add_existing_to_playlist <name> <playlist_uuid>")
+        print("  Read:              list_playlists | list_ministries | list_playlist_items <playlist_uuid>")
+        print("                     get_slides <pres_uuid>")
+        print("                     get_thumbnail <pres_uuid> <cue_index> <output_path>")
+        print("                     get_thumbnails_bulk <pres_uuid>")
+        print("                     get_active_thumbnail")
+        print("  Trigger:           trigger_slide <item_uuid> <cue_index>            (legacy: Ministries)")
+        print("                     trigger_slide_pl <playlist_uuid> <item_uuid> <cue_index>")
+        print("                     trigger_next | trigger_previous | clear_slide")
+        print("  Mutate:            delete_from_min <item_uuid>                      (legacy: Ministries)")
+        print("                     delete_from_pl <playlist_uuid> <item_uuid>")
+        print("                     reorder_min <uuid1,uuid2,...>                    (legacy: Ministries)")
+        print("                     reorder_pl <playlist_uuid> <uuid1,uuid2,...>")
         sys.exit(1)
     cmd = sys.argv[1]
     if cmd == "create":
         if len(sys.argv) < 4: print("Usage: bridge.py create <name> <folder>"); sys.exit(1)
         create_presentation(sys.argv[2], sys.argv[3])
+    elif cmd == "create_in_playlist":
+        if len(sys.argv) < 5: print("Usage: bridge.py create_in_playlist <name> <folder> <playlist_uuid>"); sys.exit(1)
+        create_in_playlist(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd == "delete":
         if len(sys.argv) < 3: print("Usage: bridge.py delete <name>"); sys.exit(1)
         delete_presentation(sys.argv[2])
     elif cmd == "add_existing":
         if len(sys.argv) < 3: print("Usage: bridge.py add_existing <name>"); sys.exit(1)
         add_existing_to_ministries(sys.argv[2])
+    elif cmd == "add_existing_to_playlist":
+        if len(sys.argv) < 4: print("Usage: bridge.py add_existing_to_playlist <name> <playlist_uuid>"); sys.exit(1)
+        add_existing_to_playlist(sys.argv[2], sys.argv[3])
     elif cmd == "list_playlists":
         list_playlists()
     elif cmd == "list_ministries":
         list_ministries()
+    elif cmd == "list_playlist_items":
+        if len(sys.argv) < 3: print("Usage: bridge.py list_playlist_items <playlist_uuid>"); sys.exit(1)
+        list_playlist_items(sys.argv[2])
     elif cmd == "get_slides":
         if len(sys.argv) < 3: print("Usage: bridge.py get_slides <pres_uuid>"); sys.exit(1)
         get_slides(sys.argv[2])
     elif cmd == "trigger_slide":
         if len(sys.argv) < 4: print("Usage: bridge.py trigger_slide <item_uuid> <cue_index>"); sys.exit(1)
         trigger_slide(sys.argv[2], sys.argv[3])
+    elif cmd == "trigger_slide_pl":
+        if len(sys.argv) < 5: print("Usage: bridge.py trigger_slide_pl <playlist_uuid> <item_uuid> <cue_index>"); sys.exit(1)
+        trigger_slide_pl(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd == "trigger_next":
         trigger_next()
     elif cmd == "trigger_previous":
@@ -547,9 +689,15 @@ if __name__ == "__main__":
     elif cmd == "delete_from_min":
         if len(sys.argv) < 3: print("Usage: bridge.py delete_from_min <item_uuid>"); sys.exit(1)
         delete_from_ministries(sys.argv[2])
+    elif cmd == "delete_from_pl":
+        if len(sys.argv) < 4: print("Usage: bridge.py delete_from_pl <playlist_uuid> <item_uuid>"); sys.exit(1)
+        delete_from_pl(sys.argv[2], sys.argv[3])
     elif cmd == "reorder_min":
         if len(sys.argv) < 3: print("Usage: bridge.py reorder_min <uuid1,uuid2,...>"); sys.exit(1)
         reorder_ministries(sys.argv[2])
+    elif cmd == "reorder_pl":
+        if len(sys.argv) < 4: print("Usage: bridge.py reorder_pl <playlist_uuid> <uuid1,uuid2,...>"); sys.exit(1)
+        reorder_pl(sys.argv[2], sys.argv[3])
     elif cmd == "get_thumbnail":
         if len(sys.argv) < 5: print("Usage: bridge.py get_thumbnail <pres_uuid> <cue_index> <output_path>"); sys.exit(1)
         get_thumbnail(sys.argv[2], sys.argv[3], sys.argv[4])
