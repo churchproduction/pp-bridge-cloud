@@ -671,7 +671,15 @@ def read_pres_for_sync(pres_uuid):
         if bs.elements:
             el = bs.elements[0].element
             if el.HasField("text"):
-                rtf = el.text.rtf_data
+                raw = el.text.rtf_data
+                # rtf_data comes out of protobuf as bytes; need str for JSON
+                if isinstance(raw, bytes):
+                    try:
+                        rtf = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        rtf = raw.decode("latin-1", errors="replace")
+                else:
+                    rtf = raw
         cue_data[cue.uuid.string] = {
             "rtf": rtf,
             "label": a.label.text or "",
@@ -870,12 +878,20 @@ def sync_pres_to_playlist(name, playlist_uuid, slides_json):
         if new_wrapper.element.HasField("text"):
             src_rtf = slide_data.get("rtf", "") or ""
             if src_rtf:
+                # The template's rtf_data may also be bytes — coerce to str for editing
+                tmpl_rtf = new_wrapper.element.text.rtf_data
+                if isinstance(tmpl_rtf, bytes):
+                    try:
+                        tmpl_rtf = tmpl_rtf.decode("utf-8")
+                    except UnicodeDecodeError:
+                        tmpl_rtf = tmpl_rtf.decode("latin-1", errors="replace")
                 # Use the cloned element's RTF (this Mac's font + styling) and swap in
                 # just the lyric text from the source RTF
                 src_text = _extract_text_from_rtf(src_rtf)
                 if src_text:
-                    new_wrapper.element.text.rtf_data = _replace_rtf_text(
-                        new_wrapper.element.text.rtf_data, src_text)
+                    new_rtf = _replace_rtf_text(tmpl_rtf, src_text)
+                    # rtf_data field is `bytes` in protobuf — encode back
+                    new_wrapper.element.text.rtf_data = new_rtf.encode("utf-8") if isinstance(new_rtf, str) else new_rtf
 
     # Serialize and save
     out = os.path.join(library, f"{final_name}.pro")
