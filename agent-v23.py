@@ -245,6 +245,9 @@ CONTROL_COMMANDS = {
     "get_thumbnails_bulk":   lambda a: ["get_thumbnails_bulk", a[0]],
     "get_active_thumbnail":  lambda a: ["get_active_thumbnail"],
     "list_playlists":        lambda a: ["list_playlists"],
+    # Cross-Mac sync (production GUI feature)
+    "read_pres_for_sync":    lambda a: ["read_pres_for_sync", a[0]],
+    "sync_pres_to_playlist": lambda a: ["sync_pres_to_playlist", a[0], a[1], a[2]],
 }
 
 def run_control_job(cmd, args):
