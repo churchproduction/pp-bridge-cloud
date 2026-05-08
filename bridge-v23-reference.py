@@ -739,37 +739,115 @@ def _find_template_pres():
 def _replace_rtf_text(rtf, new_text):
     """Replace the lyric body inside an RTF blob. Preserves all the formatting codes
     at the top (font, color, paragraph style, font size). The actual text starts after
-    the last \\cf marker like '\\cf2 ' and runs to the closing brace."""
+    the LAST \\cfN marker (which is outside the colortbl group)."""
     if not rtf or not new_text:
         return rtf
-    # Find the last "\cfN " marker — that's where text content starts
-    m = re.search(r'(\\cf\d+\s)', rtf)
-    if not m:
-        return rtf  # unfamiliar RTF shape — bail and keep original
-    head = rtf[:m.end()]
-    # Find the matching closing brace at the end
-    # RTF body ends with the final '}' that closes the document
+    if isinstance(rtf, bytes):
+        try: rtf = rtf.decode("utf-8")
+        except UnicodeDecodeError: rtf = rtf.decode("latin-1", errors="replace")
+    # Find ALL \cfN markers — RTF body color marker always comes AFTER the colortbl
+    # group, so the LAST match is the one applied to the visible text.
+    matches = list(re.finditer(r'\\cf\d+\s?', rtf))
+    if not matches:
+        return rtf  # unfamiliar RTF shape — bail
+    last = matches[-1]
+    head = rtf[:last.end()]
+    # Find the closing brace at the end of the document
     tail_match = re.search(r'\}\s*$', rtf)
     tail = rtf[tail_match.start():] if tail_match else "}"
-    # Escape backslashes and braces in the new text per RTF rules, then convert newlines
+    # Escape RTF-significant chars in the new text
     escaped = new_text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    # Newlines in RTF lyric text become \\\n (literal backslash + newline)
     escaped = escaped.replace("\n", "\\\n")
     return head + escaped + tail
 
 def _extract_text_from_rtf(rtf):
-    """Pull plain text out of an RTF blob — used for fallback if the source RTF is empty."""
+    """Pull plain lyric text out of an RTF blob.
+    Walks the RTF, tracking brace depth and skipping known header groups
+    (fonttbl, colortbl, expandedcolortbl, stylesheet, info, etc.) so their
+    contents don't leak into the output."""
     if not rtf: return ""
-    # Strip the {\rtf1...} header
-    body = re.sub(r'^\{\\rtf1[^}]*\}', '', rtf)
-    # Strip {\fonttbl...} and {\colortbl...} groups
-    body = re.sub(r'\{\\\w+[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', '', body)
-    # Strip remaining \commandN words
-    body = re.sub(r'\\[a-zA-Z]+-?\d*\s?', '', body)
-    # Strip single \ followed by symbol
-    body = re.sub(r'\\[^a-zA-Z]', '', body)
-    # Drop remaining braces
-    body = body.replace("{", "").replace("}", "")
-    return body.strip()
+    if isinstance(rtf, bytes):
+        try: rtf = rtf.decode("utf-8")
+        except UnicodeDecodeError: rtf = rtf.decode("latin-1", errors="replace")
+    out = []
+    i = 0
+    depth = 0
+    skip_until_depth = None  # if set, ignore everything until we exit this depth
+    SKIP_KEYWORDS = ("fonttbl", "colortbl", "expandedcolortbl", "stylesheet",
+                     "info", "pict", "object", "*", "filetbl", "listtable",
+                     "listoverridetable", "rsidtbl", "generator", "themedata",
+                     "datastore", "latentstyles")
+    n = len(rtf)
+    while i < n:
+        c = rtf[i]
+        if c == "\\":
+            if i + 1 >= n:
+                i += 1; continue
+            nxt = rtf[i+1]
+            # Escaped char
+            if nxt in ("\\", "{", "}"):
+                if skip_until_depth is None:
+                    out.append(nxt)
+                i += 2; continue
+            # \\\n is a line break
+            if nxt == "\n":
+                if skip_until_depth is None:
+                    out.append("\n")
+                i += 2; continue
+            # \* marks a destination — the whole group should be ignored
+            if nxt == "*":
+                if skip_until_depth is None:
+                    skip_until_depth = depth
+                i += 2; continue
+            # \' followed by 2 hex digits = special character
+            if nxt == "'" and i + 3 < n:
+                # Skip the 2 hex digits — we're not bothering with proper decoding
+                i += 4; continue
+            # Control word: alphas + optional digits
+            j = i + 1
+            while j < n and rtf[j].isalpha():
+                j += 1
+            word = rtf[i+1:j]
+            # Optional numeric param
+            if j < n and (rtf[j] == "-" or rtf[j].isdigit()):
+                while j < n and (rtf[j] == "-" or rtf[j].isdigit()):
+                    j += 1
+            # Optional space delimiter
+            if j < n and rtf[j] == " ":
+                j += 1
+            # Action on certain control words
+            if skip_until_depth is None:
+                if word == "par" or word == "line":
+                    out.append("\n")
+                elif word == "tab":
+                    out.append("\t")
+            # If we just entered a group (the previous char was '{') and this control
+            # word is a header keyword, mark this whole group for skipping
+            if skip_until_depth is None and word in SKIP_KEYWORDS:
+                skip_until_depth = depth
+            i = j
+            continue
+        if c == "{":
+            depth += 1
+            i += 1; continue
+        if c == "}":
+            depth -= 1
+            if skip_until_depth is not None and depth < skip_until_depth:
+                skip_until_depth = None
+            i += 1; continue
+        if c in ("\r", "\n"):
+            # Raw newlines in RTF source are not significant
+            i += 1; continue
+        # Plain literal char
+        if skip_until_depth is None:
+            out.append(c)
+        i += 1
+    text = "".join(out)
+    # Strip leading punctuation/whitespace artifacts (semicolons from colortbl spillover etc.)
+    text = re.sub(r"^[;\s]+", "", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
 
 def sync_pres_to_playlist(name, playlist_uuid, slides_json):
     """Build a new presentation on THIS Mac using the slides_json from the source Mac,
