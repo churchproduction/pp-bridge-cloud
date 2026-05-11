@@ -335,11 +335,20 @@ def control_loop():
             args = job.get("args", []) or []
             log(f"Ctrl {jid[:8]}: {cmd}({', '.join(repr(a)[:30] for a in args)})")
             ok, result = run_control_job(cmd, args)
-            try:
-                http("POST", f"/api/control/result/{MACHINE_ID}",
-                     {"job_id": jid, "ok": ok, "result": result})
-            except Exception as e:
-                log(f"  failed to post control result: {e}")
+            # Post the result in a background thread so a slow/hung POST
+            # doesn't block the control loop from picking up the next job.
+            # Added 2026-05-11 to fix rotating 504s caused by per-Mac TCP stalls.
+            def _post_result(jid_, ok_, result_):
+                t0 = time.time()
+                try:
+                    http("POST", f"/api/control/result/{MACHINE_ID}",
+                         {"job_id": jid_, "ok": ok_, "result": result_}, timeout=20)
+                    dt = time.time() - t0
+                    if dt > 1.0:
+                        log(f"  Ctrl {jid_[:8]}: result POST took {dt:.1f}s")
+                except Exception as e:
+                    log(f"  Ctrl {jid_[:8]}: failed to post result after {time.time()-t0:.1f}s: {e}")
+            threading.Thread(target=_post_result, args=(jid, ok, result), daemon=True).start()
         except urllib.error.URLError:
             errs += 1
             if errs == 1 or errs % 10 == 0:
