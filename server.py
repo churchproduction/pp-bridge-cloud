@@ -16,7 +16,7 @@ MAX_UPLOAD = 200 * 1024 * 1024
 
 # Control-job tuning
 AGENT_LONGPOLL_SECONDS = 25     # how long the agent's GET hangs waiting for a control job
-CONTROL_RESULT_TIMEOUT = 15     # how long the frontend POST waits for the agent to finish
+CONTROL_RESULT_TIMEOUT = 25     # how long the frontend POST waits for the agent to finish
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -659,25 +659,25 @@ class H(BaseHTTPRequestHandler):
     # Allowed commands the frontend can send. Anything not in this list is rejected.
     CONTROL_COMMANDS = {
         # Legacy (Ministries-scoped) — kept so the current frontend keeps working
-        "list_ministries":      {"args": 0, "max_wait": 10},
+        "list_ministries":      {"args": 0, "max_wait": 20},
         "delete_from_min":      {"args": 1, "max_wait": 12},
         "reorder_min":          {"args": 1, "max_wait": 12},
         "trigger_slide":        {"args": 2, "max_wait": 6},
         # Multi-playlist (parameterized) — used by the new control.html
-        "list_playlist_items":  {"args": 1, "max_wait": 10},
+        "list_playlist_items":  {"args": 1, "max_wait": 20},
         "delete_from_pl":       {"args": 2, "max_wait": 12},
         "reorder_pl":           {"args": 2, "max_wait": 12},
         "trigger_slide_pl":     {"args": 3, "max_wait": 6},
         # Playlist-agnostic — same for everyone
-        "list_playlists":       {"args": 0, "max_wait": 10},
-        "get_slides":           {"args": 1, "max_wait": 10},
+        "list_playlists":       {"args": 0, "max_wait": 20},
+        "get_slides":           {"args": 1, "max_wait": 20},
         "get_thumbnails_bulk":  {"args": 1, "max_wait": 14},
         "get_active_thumbnail": {"args": 0, "max_wait": 6},
         "trigger_next":         {"args": 0, "max_wait": 6},
         "trigger_previous":     {"args": 0, "max_wait": 6},
         "clear_slide":          {"args": 0, "max_wait": 6},
         # Cross-Mac sync (Production GUI)
-        "read_pres_for_sync":   {"args": 1, "max_wait": 10},
+        "read_pres_for_sync":   {"args": 1, "max_wait": 20},
         "sync_pres_to_playlist":{"args": 3, "max_wait": 25},
     }
 
