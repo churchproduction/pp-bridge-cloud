@@ -74,13 +74,7 @@ def run_job(job):
     name = job.get("name", "") or ""
     files = job.get("files", []) or []
     library_adds = job.get("library_adds", []) or []
-    # NEW: optional playlist routing. If absent or empty, uploads go to
-    # MIN_PLAYLIST_UUID (Ministries) via the legacy bridge.py commands —
-    # this preserves backward compat for any old jobs already in the queue.
-    playlist_uuid = (job.get("playlist_uuid") or "").strip()
-    log(f"Job {job_id[:8]}: name='{name}', files={len(files)}, "
-        f"library_adds={len(library_adds)}, "
-        f"playlist={playlist_uuid[:8] if playlist_uuid else '(default Ministries)'}")
+    log(f"Job {job_id[:8]}: name='{name}', files={len(files)}, library_adds={len(library_adds)}")
 
     msgs = []
     has_new = bool(files) and bool(name) and not name.startswith("+")
@@ -98,29 +92,22 @@ def run_job(job):
             except Exception as e:
                 return False, f"Download failed for {fname}: {e}"
         log(f"  All files downloaded to {local_folder}")
-        # Pick the right bridge.py command based on whether a playlist was specified.
-        if playlist_uuid:
-            argv = ["python3", BRIDGE_SCRIPT, "create_in_playlist", name, local_folder, playlist_uuid]
-        else:
-            argv = ["python3", BRIDGE_SCRIPT, "create", name, local_folder]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+            r = subprocess.run(["python3", BRIDGE_SCRIPT, "create", name, local_folder],
+                              capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
             return False, "bridge.py timed out after 5 min"
         if r.returncode != 0:
             return False, f"bridge.py create failed: {(r.stderr or '').strip()[-400:]}"
         msgs.append(f"Created '{name}' with {len(files)} file(s)")
 
-    # Step 2: add existing library items to the target playlist
+    # Step 2: add existing library items to Ministries
     added = 0
     failed = []
     for add_name in library_adds:
-        if playlist_uuid:
-            argv = ["python3", BRIDGE_SCRIPT, "add_existing_to_playlist", add_name, playlist_uuid]
-        else:
-            argv = ["python3", BRIDGE_SCRIPT, "add_existing", add_name]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            r = subprocess.run(["python3", BRIDGE_SCRIPT, "add_existing", add_name],
+                              capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
             failed.append(add_name)
             log(f"  add_existing '{add_name}' timed out")
@@ -227,27 +214,16 @@ def get_library_presentations():
 # Whitelist: command -> bridge.py argument template using positional args.
 # This keeps the agent dumb — the cloud has already validated arg counts.
 CONTROL_COMMANDS = {
-    # Legacy (Ministries-scoped) — kept so old clients keep working
-    "list_ministries":       lambda a: ["list_ministries"],
-    "trigger_slide":         lambda a: ["trigger_slide", a[0], a[1]],
-    "delete_from_min":       lambda a: ["delete_from_min", a[0]],
-    "reorder_min":           lambda a: ["reorder_min", a[0]],
-    # Multi-playlist (parameterized) — used by the new control.html
-    "list_playlist_items":   lambda a: ["list_playlist_items", a[0]],
-    "trigger_slide_pl":      lambda a: ["trigger_slide_pl", a[0], a[1], a[2]],
-    "delete_from_pl":        lambda a: ["delete_from_pl", a[0], a[1]],
-    "reorder_pl":            lambda a: ["reorder_pl", a[0], a[1]],
-    # Playlist-agnostic — same for everyone
-    "get_slides":            lambda a: ["get_slides", a[0]],
-    "trigger_next":          lambda a: ["trigger_next"],
-    "trigger_previous":      lambda a: ["trigger_previous"],
-    "clear_slide":           lambda a: ["clear_slide"],
-    "get_thumbnails_bulk":   lambda a: ["get_thumbnails_bulk", a[0]],
-    "get_active_thumbnail":  lambda a: ["get_active_thumbnail"],
-    "list_playlists":        lambda a: ["list_playlists"],
-    # Cross-Mac sync (production GUI feature)
-    "read_pres_for_sync":    lambda a: ["read_pres_for_sync", a[0]],
-    "sync_pres_to_playlist": lambda a: ["sync_pres_to_playlist", a[0], a[1], a[2]],
+    "list_ministries":  lambda a: ["list_ministries"],
+    "get_slides":       lambda a: ["get_slides", a[0]],
+    "trigger_slide":    lambda a: ["trigger_slide", a[0], a[1]],
+    "trigger_next":     lambda a: ["trigger_next"],
+    "trigger_previous": lambda a: ["trigger_previous"],
+    "clear_slide":      lambda a: ["clear_slide"],
+    "delete_from_min":  lambda a: ["delete_from_min", a[0]],
+    "reorder_min":      lambda a: ["reorder_min", a[0]],
+    "get_thumbnails_bulk": lambda a: ["get_thumbnails_bulk", a[0]],
+    "get_active_thumbnail": lambda a: ["get_active_thumbnail"],
 }
 
 def run_control_job(cmd, args):
