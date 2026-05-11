@@ -22,72 +22,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("cloud")
 
-# =============================================================================
-# PLAYLIST_CONFIG — per-Mac whitelist of playlists the frontend is allowed to
-# see + control + upload to. Anything not listed here is invisible to users.
-# Locked playlists require the matching frontend password (handled in JS).
-# =============================================================================
-# Lock keys (pure labels — passwords live in the frontend JS, hashed):
-#   "educator"  → existing Educator123! gate (Building C)
-#   "kids"      → FCKids
-#   "students"  → StudentsFC
-PLAYLIST_CONFIG = {
-    "mac-mini-production": {
-        "label": "Students",
-        "playlists": [
-            {"uuid": "1E89A841-7ED9-4A25-B1E8-89EAEC855827",
-             "name": "Ministries", "locked": False},
-            {"uuid": "F5B3B656-DF01-4EB8-A1A3-BBBB2E221C69",
-             "name": "Students", "locked": True, "lock_key": "students"},
-        ],
-    },
-    "kids-downstairs": {
-        "label": "Kids Downstairs",
-        "playlists": [
-            {"uuid": "8C742596-1DD9-467D-A675-3060B94E19B0",
-             "name": "Ministries", "locked": False},
-            {"uuid": "FA3A4576-C0BE-4E5C-826B-B9DC9881AD48",
-             "name": "Kids", "locked": True, "lock_key": "kids"},
-        ],
-    },
-    "building-c-led-wall": {
-        "label": "Building C LED Wall",
-        "playlists": [
-            {"uuid": "0C93437E-BC83-428E-8F8C-289CF9AA049E",
-             "name": "Ministries", "locked": False},
-            {"uuid": "A42AF03D-1393-4D21-860E-8AB83F24F579",
-             "name": "Sunday Mornings", "locked": True, "lock_key": "educator"},
-        ],
-    },
-    "building-c-side-screens": {
-        "label": "Building C Side Screens",
-        "playlists": [
-            {"uuid": "11221733-3866-44D9-9CDC-6FCA837691C1",
-             "name": "Ministries", "locked": False},
-            {"uuid": "402B033F-F602-42B1-992D-9F85B1DD41F8",
-             "name": "Sunday Mornings", "locked": True, "lock_key": "educator"},
-        ],
-    },
-}
-
-def get_playlists_for_machine(machine_id):
-    """Return the configured playlists for a machine, or [] if not in config."""
-    cfg = PLAYLIST_CONFIG.get(machine_id)
-    if not cfg:
-        return []
-    return cfg.get("playlists", [])
-
-def is_playlist_allowed(machine_id, playlist_uuid):
-    """True if the given playlist UUID is in the whitelist for this machine.
-    Used to reject mutations against unknown playlists from the cloud side."""
-    if not playlist_uuid:
-        return False
-    for pl in get_playlists_for_machine(machine_id):
-        if pl.get("uuid", "").lower() == playlist_uuid.lower():
-            return True
-    return False
-
-
 def sanitize_filename(name):
     """Strip unicode oddities (narrow space, smart quotes, emoji), unsafe chars."""
     name = unicodedata.normalize("NFKD", name)
@@ -152,7 +86,6 @@ def init_db():
                 folder TEXT NOT NULL,
                 files_json TEXT NOT NULL,
                 library_adds_json TEXT NOT NULL DEFAULT '[]',
-                playlist_uuid TEXT NOT NULL DEFAULT '',
                 result TEXT DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -178,7 +111,6 @@ def init_db():
         for ddl in [
             "ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN library_adds_json TEXT NOT NULL DEFAULT '[]'",
-            "ALTER TABLE jobs ADD COLUMN playlist_uuid TEXT NOT NULL DEFAULT ''",
         ]:
             try:
                 c.execute(ddl)
@@ -496,27 +428,11 @@ class H(BaseHTTPRequestHandler):
                     agents.append({"machine_id": r["machine_id"], "name": r["name"],
                                    "online": is_online_row(r), "queued": q,
                                    "last_seen_ago": round(now() - r["last_seen"], 1),
-                                   "presentations": pres,
-                                   "playlists": get_playlists_for_machine(r["machine_id"])})
+                                   "presentations": pres})
                 jobs = [{"job_id": j["job_id"], "machine_id": j["machine_id"],
                          "name": j["name"], "status": j["status"], "result": j["result"]}
                         for j in c.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 30")]
             return self._send_json(200, {"agents": agents, "jobs": jobs, "lockout": is_locked_now()})
-        if u.path == "/api/playlists":
-            # Optional ?machine_id=… query string — if missing, return all configs.
-            from urllib.parse import parse_qs
-            qs = parse_qs(u.query or "")
-            mid = (qs.get("machine_id", [""])[0] or "").strip()
-            if mid:
-                return self._send_json(200, {
-                    "machine_id": mid,
-                    "playlists": get_playlists_for_machine(mid),
-                })
-            # No machine_id → return everything (handy for debugging)
-            out = {}
-            for k, v in PLAYLIST_CONFIG.items():
-                out[k] = v.get("playlists", [])
-            return self._send_json(200, {"all": out})
         if u.path.startswith("/api/agent/poll/"):
             mid = u.path.rsplit("/", 1)[-1]
             with db_lock, db() as c:
@@ -538,8 +454,7 @@ class H(BaseHTTPRequestHandler):
                 job = {"job_id": row["job_id"], "machine_id": row["machine_id"],
                        "name": row["name"], "folder": row["folder"],
                        "files": json.loads(row["files_json"]),
-                       "library_adds": library_adds,
-                       "playlist_uuid": row["playlist_uuid"] or ""}
+                       "library_adds": library_adds}
             return self._send_json(200, job)
         if u.path.startswith("/api/control/poll/"):
             return self._control_poll(u.path.rsplit("/", 1)[-1])
@@ -616,11 +531,6 @@ class H(BaseHTTPRequestHandler):
                 return self._send_json(423, {"error": "service_lockout",
                     "message": "Uploads are locked during Sunday service hours."})
             return self._submit_job()
-        if u.path == "/api/sync_presentation":
-            if is_request_blocked(self.headers):
-                return self._send_json(423, {"error": "service_lockout",
-                    "message": "Sync is locked during Sunday service hours."})
-            return self._sync_presentation()
         if u.path == "/api/gate-event":
             # Frontend reports a gate password attempt (success or fail).
             # Body: {"success": true|false, "page": "control"|"index", "attempt_hash": "<sha256>"}
@@ -658,27 +568,19 @@ class H(BaseHTTPRequestHandler):
     # =========================================================================
     # Allowed commands the frontend can send. Anything not in this list is rejected.
     CONTROL_COMMANDS = {
-        # Legacy (Ministries-scoped) — kept so the current frontend keeps working
-        "list_ministries":      {"args": 0, "max_wait": 10},
-        "delete_from_min":      {"args": 1, "max_wait": 12},
-        "reorder_min":          {"args": 1, "max_wait": 12},
-        "trigger_slide":        {"args": 2, "max_wait": 6},
-        # Multi-playlist (parameterized) — used by the new control.html
-        "list_playlist_items":  {"args": 1, "max_wait": 10},
-        "delete_from_pl":       {"args": 2, "max_wait": 12},
-        "reorder_pl":           {"args": 2, "max_wait": 12},
-        "trigger_slide_pl":     {"args": 3, "max_wait": 6},
-        # Playlist-agnostic — same for everyone
-        "list_playlists":       {"args": 0, "max_wait": 10},
-        "get_slides":           {"args": 1, "max_wait": 10},
-        "get_thumbnails_bulk":  {"args": 1, "max_wait": 14},
+        # read-only
+        "list_ministries":   {"args": 0, "max_wait": 10},
+        "get_slides":        {"args": 1, "max_wait": 10},
+        "get_thumbnails_bulk": {"args": 1, "max_wait": 14},
         "get_active_thumbnail": {"args": 0, "max_wait": 6},
-        "trigger_next":         {"args": 0, "max_wait": 6},
-        "trigger_previous":     {"args": 0, "max_wait": 6},
-        "clear_slide":          {"args": 0, "max_wait": 6},
-        # Cross-Mac sync (Production GUI)
-        "read_pres_for_sync":   {"args": 1, "max_wait": 10},
-        "sync_pres_to_playlist":{"args": 3, "max_wait": 25},
+        # mutations
+        "delete_from_min":   {"args": 1, "max_wait": 12},
+        "reorder_min":       {"args": 1, "max_wait": 12},
+        # triggers (fast — short timeout)
+        "trigger_slide":     {"args": 2, "max_wait": 6},
+        "trigger_next":      {"args": 0, "max_wait": 6},
+        "trigger_previous":  {"args": 0, "max_wait": 6},
+        "clear_slide":       {"args": 0, "max_wait": 6},
     }
 
     def _control_submit(self):
@@ -697,13 +599,6 @@ class H(BaseHTTPRequestHandler):
         if len(args) != spec["args"]:
             return self._send_json(400, {"error": f"{cmd} expects {spec['args']} arg(s), got {len(args)}"})
         args = [str(a)[:1000] for a in args]
-        # For any *_pl command, args[0] is a playlist UUID. Validate it's whitelisted.
-        # This is a defense-in-depth check — the frontend shouldn't send unknown
-        # UUIDs, but if something slips through (or a malicious client tries),
-        # we reject server-side.
-        if cmd in ("list_playlist_items", "delete_from_pl", "reorder_pl", "trigger_slide_pl"):
-            if not is_playlist_allowed(mid, args[0]):
-                return self._send_json(403, {"error": f"playlist {args[0]} not allowed for machine {mid}"})
         # Verify the agent exists
         with db_lock, db() as c:
             ag = c.execute("SELECT * FROM agents WHERE machine_id=?", (mid,)).fetchone()
@@ -815,106 +710,7 @@ class H(BaseHTTPRequestHandler):
             c.commit()
         return self._send_json(200, {"ok": True})
 
-    def _sync_presentation(self):
-        """Orchestrate a cross-Mac sync. Body:
-        {
-          "source_machine_id": "building-c-side-screens",
-          "source_pres_uuid": "DB956B6B-...",
-          "source_name": "Build My Life",  // for display
-          "dest_machine_id": "building-c-led-wall",
-          "dest_playlist_uuid": "A42AF03D-..."
-        }
-        Returns the result of the destination's sync_pres_to_playlist call.
-        """
-        b = self._read_json()
-        src_mid = (b.get("source_machine_id") or "").strip()
-        src_pres = (b.get("source_pres_uuid") or "").strip()
-        src_name = (b.get("source_name") or "Untitled").strip()
-        dest_mid = (b.get("dest_machine_id") or "").strip()
-        dest_pl = (b.get("dest_playlist_uuid") or "").strip()
-        if not (src_mid and src_pres and dest_mid and dest_pl):
-            return self._send_json(400, {"error": "need source_machine_id, source_pres_uuid, dest_machine_id, dest_playlist_uuid"})
-        # Validate the destination playlist is whitelisted for the destination Mac
-        if not is_playlist_allowed(dest_mid, dest_pl):
-            return self._send_json(403, {"error": f"playlist {dest_pl} not allowed for machine {dest_mid}"})
-        # Verify both agents exist + online
-        with db_lock, db() as c:
-            src_ag = c.execute("SELECT * FROM agents WHERE machine_id=?", (src_mid,)).fetchone()
-            dest_ag = c.execute("SELECT * FROM agents WHERE machine_id=?", (dest_mid,)).fetchone()
-        if not src_ag: return self._send_json(404, {"error": f"unknown source machine {src_mid}"})
-        if not dest_ag: return self._send_json(404, {"error": f"unknown dest machine {dest_mid}"})
-        if not is_online_row(src_ag): return self._send_json(503, {"error": "source machine offline"})
-        if not is_online_row(dest_ag): return self._send_json(503, {"error": "destination machine offline"})
-
-        # Step 1: ask source Mac to read the presentation structure
-        read_result = self._run_control_sync(src_mid, "read_pres_for_sync", [src_pres], 12)
-        if not read_result or not read_result.get("ok"):
-            err = (read_result or {}).get("error", "source read failed")
-            return self._send_json(500, {"error": f"source read failed: {err}"})
-        slides = read_result.get("slides", [])
-        if not slides:
-            return self._send_json(500, {"error": "source presentation has no slides to sync"})
-        canonical_name = read_result.get("name") or src_name
-
-        # Step 2: ask destination Mac to build the new presentation
-        slides_json = json.dumps(slides)
-        # Guard against very large payloads (RTF can be heavy)
-        if len(slides_json) > 800000:
-            return self._send_json(500, {"error": f"slides payload too large ({len(slides_json)} bytes)"})
-        build_result = self._run_control_sync(dest_mid, "sync_pres_to_playlist",
-                                              [canonical_name, dest_pl, slides_json], 25)
-        if not build_result or not build_result.get("ok"):
-            err = (build_result or {}).get("error", "destination build failed")
-            return self._send_json(500, {"error": f"destination build failed: {err}"})
-
-        # Discord notification — sync events go to #remote
-        try:
-            discord_post("remote", {
-                "title": "🔁 Sync completed",
-                "color": COLOR_BLUE,
-                "fields": [
-                    {"name": "From", "value": src_ag["name"] if src_ag else src_mid, "inline": True},
-                    {"name": "To", "value": dest_ag["name"] if dest_ag else dest_mid, "inline": True},
-                    {"name": "Source", "value": canonical_name, "inline": False},
-                    {"name": "Created", "value": build_result.get("created_name", "?") +
-                        (" (renamed)" if build_result.get("renamed") else ""), "inline": True},
-                    {"name": "Slides", "value": str(build_result.get("slides_count", "?")), "inline": True},
-                ],
-            })
-        except Exception:
-            pass
-
-        return self._send_json(200, {
-            "ok": True,
-            "source_name": canonical_name,
-            "created_name": build_result.get("created_name"),
-            "renamed": build_result.get("renamed", False),
-            "slides_count": build_result.get("slides_count"),
-        })
-
-    def _run_control_sync(self, machine_id, command, args, max_wait):
-        """Helper: enqueue a control job and synchronously wait for the agent's result.
-        Used by _sync_presentation to chain multiple agent calls. Returns the result dict
-        (or None on timeout/failure)."""
-        jid = uuid.uuid4().hex
-        ts = now()
-        with db_lock, db() as c:
-            c.execute("INSERT INTO control_jobs(job_id, machine_id, command, args_json, status, "
-                      "result_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                      (jid, machine_id, command, json.dumps(args), "queued", "", ts, ts))
-            c.commit()
-        deadline = time.time() + max_wait
-        while time.time() < deadline:
-            with db_lock, db() as c:
-                row = c.execute("SELECT status, result_json FROM control_jobs WHERE job_id=?",
-                                (jid,)).fetchone()
-            if row and row["status"] in ("done", "failed"):
-                try:
-                    return json.loads(row["result_json"]) if row["result_json"] else None
-                except Exception:
-                    return {"ok": False, "error": "malformed result"}
-            time.sleep(0.15)
-        return {"ok": False, "error": f"timeout after {max_wait}s"}
+    def _upload_form(self):
         agents_json = "[]"
         try:
             with db_lock, db() as c:
@@ -1008,7 +804,6 @@ f.addEventListener('submit', async e => {
         parts = raw.split(b"--" + boundary)
         machine_id = name = None
         library_adds_raw = ""
-        playlist_uuid = ""
         files = []
         for p in parts:
             p = p.strip(b"\r\n")
@@ -1029,8 +824,6 @@ f.addEventListener('submit', async e => {
                 name = content.decode()
             elif field_name == "library_adds":
                 library_adds_raw = content.decode()
-            elif field_name == "playlist_uuid":
-                playlist_uuid = content.decode().strip()
         library_adds = []
         if library_adds_raw:
             try:
@@ -1041,10 +834,6 @@ f.addEventListener('submit', async e => {
                 pass
         if not machine_id:
             return self._send_json(400, {"error": "need machine_id"})
-        # Validate playlist_uuid against PLAYLIST_CONFIG. Empty string is allowed
-        # (means "use default Ministries" via legacy bridge.py path).
-        if playlist_uuid and not is_playlist_allowed(machine_id, playlist_uuid):
-            return self._send_json(403, {"error": f"playlist {playlist_uuid} not allowed for machine {machine_id}"})
         has_new = bool(name and files)
         has_existing = bool(library_adds)
         if not has_new and not has_existing:
@@ -1086,34 +875,23 @@ f.addEventListener('submit', async e => {
                 c.execute("INSERT INTO agents(machine_id, name, last_seen, presentations) VALUES(?,?,0,'[]')",
                           (machine_id, "(offline)"))
             c.execute("INSERT INTO jobs(job_id, machine_id, name, status, folder, files_json, "
-                      "library_adds_json, playlist_uuid, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      "library_adds_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                       (jid, machine_id, display_name, "queued", jdir,
-                       json.dumps(saved), json.dumps(library_adds), playlist_uuid, ts, ts))
+                       json.dumps(saved), json.dumps(library_adds), ts, ts))
             c.commit()
         log.info(f"  -> Job {jid[:8]} queued for {machine_id}: '{display_name}' "
-                 f"({len(saved)} files, {len(library_adds)} library_adds, "
-                 f"playlist={playlist_uuid[:8] if playlist_uuid else 'default'})")
+                 f"({len(saved)} files, {len(library_adds)} library_adds)")
         # Discord: upload received
         try:
             with db_lock, db() as c:
                 ag = c.execute("SELECT name FROM agents WHERE machine_id=?", (machine_id,)).fetchone()
             mac_label = ag["name"] if ag else machine_id
-            # Find the playlist's display name for the Discord message
-            pl_label = "Ministries (default)"
-            if playlist_uuid:
-                for pl in get_playlists_for_machine(machine_id):
-                    if pl.get("uuid", "").lower() == playlist_uuid.lower():
-                        pl_label = pl.get("name", playlist_uuid[:8])
-                        break
-                else:
-                    pl_label = playlist_uuid[:8]
             file_summary = ", ".join(saved[:8]) + (f" (+{len(saved)-8} more)" if len(saved) > 8 else "")
             adds_summary = ", ".join(library_adds[:8]) + (f" (+{len(library_adds)-8} more)" if len(library_adds) > 8 else "")
             fields = [
                 {"name": "From", "value": client_ip(self), "inline": True},
                 {"name": "To", "value": mac_label, "inline": True},
-                {"name": "Playlist", "value": pl_label, "inline": True},
-                {"name": "Status", "value": "📥 Received, queued", "inline": False},
+                {"name": "Status", "value": "📥 Received, queued", "inline": True},
                 {"name": "Presentation", "value": display_name[:200], "inline": False},
             ]
             if saved:
