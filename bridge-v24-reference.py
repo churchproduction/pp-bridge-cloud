@@ -102,6 +102,13 @@ def sanitize_name(name):
 def uid(): return str(uuid.uuid4()).upper()
 def file_url(p): return "file://" + urllib.parse.quote(p, safe="/")
 
+def natural_sort_key(s):
+    """Key function for natural sorting — treats embedded numbers as numbers.
+    'may10led-wall2' sorts before 'may10led-wall10' (instead of after, which is the
+    default lexicographic order). Use as the `key=` arg to sorted() or list.sort()."""
+    name = os.path.basename(s).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r'(\d+)', name)]
+
 def find_in_playlist(plid, name):
     pl = api("GET", f"/playlist/{plid}")
     items = pl.get("items", []) if pl else []
@@ -256,8 +263,9 @@ def _build_pro_for_media(name, folder):
     COMPLETION_ACTION_TYPE_LAST    = find_enum("COMPLETION_ACTION_TYPE_LAST")
     ROOT_SHOW                      = find_enum("ROOT_SHOW")
 
-    media = sorted([f for f in glob.glob(os.path.join(folder, "*"))
-                    if f.lower().endswith(ALL_EXTS)])
+    media = sorted(
+        [f for f in glob.glob(os.path.join(folder, "*")) if f.lower().endswith(ALL_EXTS)],
+        key=natural_sort_key)
     if not media: print(f"No media in {folder}"); sys.exit(1)
     print(f"[1/4] {len(media)} file(s)")
     target = os.path.join(ASSETS_DIR, name)
@@ -630,8 +638,116 @@ def get_active_thumbnail():
         _emit({"ok": True, "active": False, "reason": f"thumbnail_fetch_failed ({e})"})
 
 # =============================================================================
-# SYNC COMMANDS — for cross-Mac presentation copying with theme adaptation
+# ADD SLIDES — append media slides to an existing presentation in-place
 # =============================================================================
+
+def add_slides_to_pres(pres_uuid, folder):
+    """Append media slides (images or videos) from a folder to an existing .pro file.
+    Slides are added to the LAST cue group (or a new ungrouped section if there isn't one),
+    at the end of the cue list. Returns count of slides appended."""
+    library = get_library_dir()
+    if not library:
+        _emit({"ok": False, "error": "no library folder"}); return
+
+    path, pres = find_pres_by_uuid(pres_uuid)
+    if not pres:
+        _emit({"ok": False, "error": f"presentation {pres_uuid} not found"}); return
+
+    pres_name = pres.name
+    print(f"Found {pres_name} at {path}")
+
+    Presentation                   = find_msg("Presentation")
+    PLATFORM_MACOS                 = find_enum("PLATFORM_MACOS")
+    ACTION_TYPE_PRESENTATION_SLIDE = find_enum("ACTION_TYPE_PRESENTATION_SLIDE")
+    ACTION_TYPE_MEDIA              = find_enum("ACTION_TYPE_MEDIA")
+    LAYER_TYPE_FOREGROUND          = find_enum("LAYER_TYPE_FOREGROUND")
+    COMPLETION_ACTION_TYPE_LAST    = find_enum("COMPLETION_ACTION_TYPE_LAST")
+    ROOT_SHOW                      = find_enum("ROOT_SHOW")
+
+    media = sorted(
+        [f for f in glob.glob(os.path.join(folder, "*")) if f.lower().endswith(ALL_EXTS)],
+        key=natural_sort_key)
+    if not media:
+        _emit({"ok": False, "error": f"no usable media files in {folder}"}); return
+
+    # Copy the new files into the presentation's existing assets dir.
+    # If the presentation was originally created via _build_pro_for_media, its assets
+    # live under Media/Assets/<name>/. We follow that same convention so PP's URL
+    # resolution works correctly.
+    target = os.path.join(ASSETS_DIR, pres_name)
+    os.makedirs(target, exist_ok=True)
+    copied = []
+    for m in media:
+        clean = sanitize_name(os.path.basename(m))
+        dest = os.path.join(target, clean)
+        base, ext = os.path.splitext(clean); n = 1
+        while os.path.exists(dest):
+            dest = os.path.join(target, f"{base}-{n}{ext}"); n += 1
+        shutil.copy2(m, dest); copied.append(dest)
+    print(f"Copied {len(copied)} file(s) to {target}")
+
+    # Decide which cue_group to append to. Strategy: use the LAST existing group
+    # so slides land at the very end of the presentation. If there are no groups
+    # at all (edge case — shouldn't really happen), create one.
+    if pres.cue_groups:
+        target_group = pres.cue_groups[-1]
+    else:
+        target_group = pres.cue_groups.add()
+        target_group.group.uuid.string = uid()
+        target_group.group.name = ""
+
+    # Build new cues, mirroring _build_pro_for_media's structure.
+    new_cue_uuids = []
+    for p in copied:
+        fname = os.path.basename(p)
+        ext = os.path.splitext(fname)[1].lower().lstrip(".")
+        fmt = ext.upper().replace("JPEG", "JPG")
+        cue_uuid = uid()
+        new_cue_uuids.append(cue_uuid)
+
+        cue = pres.cues.add()
+        cue.uuid.string = cue_uuid
+        cue.completion_action_type = COMPLETION_ACTION_TYPE_LAST
+        cue.isEnabled = True
+
+        a1 = cue.actions.add()
+        a1.uuid.string = uid(); a1.label.text = fname
+        a1.isEnabled = True; a1.type = ACTION_TYPE_PRESENTATION_SLIDE
+        bs = a1.slide.presentation.base_slide
+        bs.size.width = 1920; bs.size.height = 1080
+        bs.uuid.string = uid()
+        a1.slide.presentation.chord_chart.platform = PLATFORM_MACOS
+
+        a2 = cue.actions.add()
+        a2.uuid.string = uid(); a2.isEnabled = True
+        a2.type = ACTION_TYPE_MEDIA
+        el = a2.media.element
+        el.uuid.string = uid()
+        el.url.absolute_string = file_url(p)
+        el.url.platform = PLATFORM_MACOS
+        el.url.local.root = ROOT_SHOW
+        el.url.local.path = f"Media/Assets/{pres_name}/{fname}"
+        el.metadata.format = fmt
+        el.image.drawing.natural_size.width = 1920
+        el.image.drawing.natural_size.height = 1080
+        a2.media.layer_type = LAYER_TYPE_FOREGROUND
+
+    # Append the new cue UUIDs to the target group's cue_identifiers.
+    for cu in new_cue_uuids:
+        target_group.cue_identifiers.add().string = cu
+
+    # Save
+    with open(path, "wb") as f: f.write(pres.SerializeToString())
+    print(f"Saved {path} with {len(new_cue_uuids)} new slide(s)")
+
+    _emit({
+        "ok": True,
+        "presentation_name": pres_name,
+        "added_count": len(new_cue_uuids),
+        "files_added": [os.path.basename(p) for p in copied],
+    })
+
+
 
 def find_pres_by_uuid(pres_uuid):
     """Find a .pro file in any library by presentation UUID. Returns (path, parsed_pres) or (None, None)."""
@@ -1095,4 +1211,7 @@ if __name__ == "__main__":
     elif cmd == "sync_pres_to_playlist":
         if len(sys.argv) < 5: print("Usage: bridge.py sync_pres_to_playlist <name> <playlist_uuid> <slides_json>"); sys.exit(1)
         sync_pres_to_playlist(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif cmd == "add_slides_to_pres":
+        if len(sys.argv) < 4: print("Usage: bridge.py add_slides_to_pres <pres_uuid> <folder>"); sys.exit(1)
+        add_slides_to_pres(sys.argv[2], sys.argv[3])
     else: print(f"Unknown: {cmd}"); sys.exit(1)
