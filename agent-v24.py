@@ -52,7 +52,7 @@ def log(msg):
 # ── Cloud HTTP helpers ─────────────────────────────────────────────
 def http(method, path, body=None, timeout=15):
     url = CLOUD_URL + path
-    data, headers = None, {}
+    data, headers = None, {"Connection": "close"}
     if body is not None:
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
