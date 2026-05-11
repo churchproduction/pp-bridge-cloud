@@ -78,54 +78,13 @@ def run_job(job):
     # MIN_PLAYLIST_UUID (Ministries) via the legacy bridge.py commands —
     # this preserves backward compat for any old jobs already in the queue.
     playlist_uuid = (job.get("playlist_uuid") or "").strip()
-    # NEW: append-slides mode. If add_to_pres_uuid is set, files get appended
-    # to that existing presentation instead of creating a new one. The `name`
-    # and `playlist_uuid` fields are ignored when appending.
-    add_to_pres_uuid = (job.get("add_to_pres_uuid") or "").strip()
     log(f"Job {job_id[:8]}: name='{name}', files={len(files)}, "
         f"library_adds={len(library_adds)}, "
-        f"playlist={playlist_uuid[:8] if playlist_uuid else '(default Ministries)'}, "
-        f"add_to_pres={add_to_pres_uuid[:8] if add_to_pres_uuid else 'none'}")
+        f"playlist={playlist_uuid[:8] if playlist_uuid else '(default Ministries)'}")
 
     msgs = []
     has_new = bool(files) and bool(name) and not name.startswith("+")
-    has_append = bool(files) and bool(add_to_pres_uuid)
     local_folder = None
-
-    # APPEND mode takes priority — if both have_new and has_append are somehow
-    # set (shouldn't happen from the frontend), append wins because it's the
-    # explicit mode.
-    if has_append:
-        local_folder = os.path.join(JOB_WORKDIR, job_id)
-        if os.path.exists(local_folder): shutil.rmtree(local_folder)
-        os.makedirs(local_folder, exist_ok=True)
-        for fname in files:
-            try:
-                log(f"  Downloading {fname}...")
-                download_file(job_id, fname, os.path.join(local_folder, fname))
-            except Exception as e:
-                return False, f"Download failed for {fname}: {e}"
-        log(f"  All files downloaded to {local_folder}")
-        argv = ["python3", BRIDGE_SCRIPT, "add_slides_to_pres", add_to_pres_uuid, local_folder]
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            return False, "bridge.py timed out after 5 min (append)"
-        if r.returncode != 0:
-            return False, f"bridge.py add_slides_to_pres failed: {(r.stderr or '').strip()[-400:]}"
-        # Parse JSON from bridge.py output if available, else just confirm
-        try:
-            obj = json.loads((r.stdout or "").strip().splitlines()[-1])
-            if obj.get("ok"):
-                msgs.append(f"Added {obj.get('added_count', len(files))} slide(s) to '{obj.get('presentation_name', '?')}'")
-            else:
-                return False, f"add_slides_to_pres reported error: {obj.get('error', 'unknown')}"
-        except Exception:
-            msgs.append(f"Added {len(files)} slide(s)")
-        # Cleanup
-        try: shutil.rmtree(local_folder)
-        except Exception: pass
-        return True, "; ".join(msgs)
 
     # Step 1: download files and create new presentation
     if has_new:
