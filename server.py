@@ -719,9 +719,12 @@ class H(BaseHTTPRequestHandler):
                       (jid, mid, cmd, json.dumps(args), "queued", "", ts, ts))
             c.commit()
         # Wait up to spec["max_wait"] for the agent to complete the job
+        # NOTE: don't take db_lock during this hot polling loop — SELECTs are safe
+        # under WAL mode and holding the global lock here starves the agent's
+        # result POST (which needs the lock to UPDATE the row we're waiting for).
         deadline = time.time() + min(spec["max_wait"], CONTROL_RESULT_TIMEOUT)
         while time.time() < deadline:
-            with db_lock, db() as c:
+            with db() as c:
                 row = c.execute("SELECT status, result_json FROM control_jobs WHERE job_id=?",
                                 (jid,)).fetchone()
             if row and row["status"] in ("done", "failed"):
@@ -778,22 +781,27 @@ class H(BaseHTTPRequestHandler):
             c.commit()
         deadline = time.time() + AGENT_LONGPOLL_SECONDS
         while time.time() < deadline:
-            with db_lock, db() as c:
+            # Cheap unlocked SELECT first — only acquire global lock to claim a job
+            with db() as c:
                 row = c.execute("SELECT * FROM control_jobs WHERE machine_id=? AND status='queued' "
                                 "ORDER BY created_at LIMIT 1", (mid,)).fetchone()
-                if row:
-                    c.execute("UPDATE control_jobs SET status='dispatched', updated_at=? WHERE job_id=?",
-                              (now(), row["job_id"]))
+            if row:
+                # Got a candidate — claim it under the lock
+                with db_lock, db() as c:
+                    claim = c.execute("UPDATE control_jobs SET status='dispatched', updated_at=? "
+                                      "WHERE job_id=? AND status='queued'",
+                                      (now(), row["job_id"]))
                     c.commit()
-                    try:
-                        args = json.loads(row["args_json"] or "[]")
-                    except Exception:
-                        args = []
-                    return self._send_json(200, {
-                        "job_id": row["job_id"],
-                        "command": row["command"],
-                        "args": args,
-                    })
+                    if claim.rowcount > 0:
+                        try:
+                            args = json.loads(row["args_json"] or "[]")
+                        except Exception:
+                            args = []
+                        return self._send_json(200, {
+                            "job_id": row["job_id"],
+                            "command": row["command"],
+                            "args": args,
+                        })
             time.sleep(0.15)
         return self._send_json(200, None)
 
