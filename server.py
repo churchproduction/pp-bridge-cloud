@@ -718,6 +718,7 @@ class H(BaseHTTPRequestHandler):
                       "result_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
                       (jid, mid, cmd, json.dumps(args), "queued", "", ts, ts))
             c.commit()
+        log.info(f"CTRL {jid[:8]} QUEUED cmd={cmd} mid={mid}")
         # Wait up to spec["max_wait"] for the agent to complete the job
         # NOTE: don't take db_lock during this hot polling loop — SELECTs are safe
         # under WAL mode and holding the global lock here starves the agent's
@@ -762,12 +763,14 @@ class H(BaseHTTPRequestHandler):
                     })
                 except Exception as e:
                     log.warning(f"Discord remote notification failed: {e}")
+                log.info(f"CTRL {jid[:8]} RETURN ok={final_ok} after {time.time()-ts:.2f}s")
                 return self._send_json(200, {
                     "job_id": jid,
                     "ok": final_ok,
                     "result": result,
                 })
             time.sleep(0.1)
+        log.info(f"CTRL {jid[:8]} TIMEOUT after {time.time()-ts:.2f}s (limit {spec['max_wait']}s)")
         return self._send_json(504, {"job_id": jid, "ok": False,
                                      "error": f"timed out after {spec['max_wait']}s"})
 
@@ -797,6 +800,7 @@ class H(BaseHTTPRequestHandler):
                             args = json.loads(row["args_json"] or "[]")
                         except Exception:
                             args = []
+                        log.info(f"CTRL {row['job_id'][:8]} DISPATCHED to {mid}")
                         return self._send_json(200, {
                             "job_id": row["job_id"],
                             "command": row["command"],
@@ -813,6 +817,7 @@ class H(BaseHTTPRequestHandler):
         result = b.get("result")
         if not jid:
             return self._send_json(400, {"error": "missing job_id"})
+        log.info(f"CTRL {jid[:8]} RESULT_IN ok={ok}")
         try:
             rj = json.dumps(result) if result is not None else ""
         except Exception:
@@ -821,6 +826,7 @@ class H(BaseHTTPRequestHandler):
             c.execute("UPDATE control_jobs SET status=?, result_json=?, updated_at=? WHERE job_id=?",
                       ("done" if ok else "failed", rj, now(), jid))
             c.commit()
+        log.info(f"CTRL {jid[:8]} RESULT_COMMITTED")
         return self._send_json(200, {"ok": True})
 
     def _sync_presentation(self):
