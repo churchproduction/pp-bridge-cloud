@@ -736,26 +736,35 @@ def add_slides_to_pres(pres_uuid, folder):
     for cu in new_cue_uuids:
         target_group.cue_identifiers.add().string = cu
 
-    # Save — rename-then-write trick to force ProPresenter to reload.
-    # PP doesn't notice in-place file overwrites (the inode is the same and PP
-    # caches the parsed contents indefinitely). But PP DOES rescan when a file
-    # at a known path "appears" — so we rename the existing .pro out of the way,
-    # write the new contents at the original path (new inode), then delete the
-    # old one. This makes PP treat it as a fresh file and reload from disk.
-    # Confirmed working 2026-05-11 via the BRIDGE_TEST_* probe.
+    # Save — stronger rename-rewrite with explicit "gone then back" timing.
+    # PP scans the library on /libraries calls. We want PP to:
+    #   1. See the original file is GONE (evicts cached UUID)
+    #   2. See a fresh file at the same path (re-parses it on next open)
+    # The earlier "quick rename" version wasn't enough — PP didn't notice the
+    # brief disappearance. This version pokes /libraries between each FS step
+    # to force PP to scan and observe the file's absence/reappearance.
     bak = path + ".bridgetmp"
     serialized = pres.SerializeToString()
     try:
         if os.path.exists(bak):
             os.remove(bak)
+        # Step 1: rename original out of the way
         os.rename(path, bak)
+        # Step 2: poke PP to scan the library and see that the file is gone
+        try: api("GET", "/libraries")
+        except Exception: pass
+        time.sleep(0.4)
+        # Step 3: write new content at original path
         with open(path, "wb") as f: f.write(serialized)
+        # Step 4: poke PP again so it scans and picks up the "new" file
+        try: api("GET", "/libraries")
+        except Exception: pass
+        time.sleep(0.2)
+        # Step 5: remove the .bridgetmp (no longer needed)
         os.remove(bak)
     except Exception as e:
-        # Fall back to plain in-place write so we never lose the file
         print(f"  rename-rewrite failed ({e}), falling back to in-place write")
         with open(path, "wb") as f: f.write(serialized)
-        # Restore from .bak if the rewrite path errored mid-way
         if os.path.exists(bak) and not os.path.exists(path):
             os.rename(bak, path)
     print(f"Saved {path} with {len(new_cue_uuids)} new slide(s)")
