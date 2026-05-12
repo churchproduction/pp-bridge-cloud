@@ -153,6 +153,7 @@ def init_db():
                 files_json TEXT NOT NULL,
                 library_adds_json TEXT NOT NULL DEFAULT '[]',
                 playlist_uuid TEXT NOT NULL DEFAULT '',
+                add_to_pres_uuid TEXT NOT NULL DEFAULT '',
                 result TEXT DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -179,6 +180,7 @@ def init_db():
             "ALTER TABLE agents ADD COLUMN presentations TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN library_adds_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN playlist_uuid TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE jobs ADD COLUMN add_to_pres_uuid TEXT NOT NULL DEFAULT ''",
         ]:
             try:
                 c.execute(ddl)
@@ -539,7 +541,8 @@ class H(BaseHTTPRequestHandler):
                        "name": row["name"], "folder": row["folder"],
                        "files": json.loads(row["files_json"]),
                        "library_adds": library_adds,
-                       "playlist_uuid": row["playlist_uuid"] or ""}
+                       "playlist_uuid": row["playlist_uuid"] or "",
+                       "add_to_pres_uuid": row["add_to_pres_uuid"] or ""}
             return self._send_json(200, job)
         if u.path.startswith("/api/control/poll/"):
             return self._control_poll(u.path.rsplit("/", 1)[-1])
@@ -1023,6 +1026,7 @@ f.addEventListener('submit', async e => {
         machine_id = name = None
         library_adds_raw = ""
         playlist_uuid = ""
+        add_to_pres_uuid = ""
         files = []
         for p in parts:
             p = p.strip(b"\r\n")
@@ -1045,6 +1049,8 @@ f.addEventListener('submit', async e => {
                 library_adds_raw = content.decode()
             elif field_name == "playlist_uuid":
                 playlist_uuid = content.decode().strip()
+            elif field_name == "add_to_pres_uuid":
+                add_to_pres_uuid = content.decode().strip()
         library_adds = []
         if library_adds_raw:
             try:
@@ -1061,8 +1067,9 @@ f.addEventListener('submit', async e => {
             return self._send_json(403, {"error": f"playlist {playlist_uuid} not allowed for machine {machine_id}"})
         has_new = bool(name and files)
         has_existing = bool(library_adds)
-        if not has_new and not has_existing:
-            return self._send_json(400, {"error": "need either (name + files) or library_adds"})
+        has_append = bool(add_to_pres_uuid and files)
+        if not has_new and not has_existing and not has_append:
+            return self._send_json(400, {"error": "need (name + files), library_adds, or (add_to_pres_uuid + files)"})
         jid = str(uuid.uuid4())
         jdir = os.path.join(UPLOAD_DIR, jid)
         os.makedirs(jdir, exist_ok=True)
@@ -1091,22 +1098,30 @@ f.addEventListener('submit', async e => {
             except Exception as e:
                 log.error(f"PPTX conversion failed for {pptx}: {e}")
                 return self._send_json(500, {"error": f"PPTX conversion failed: {e}"})
-        if has_new and not saved:
+        if (has_new or has_append) and not saved:
             return self._send_json(400, {"error": "no usable files after processing"})
-        display_name = name if name else f"+{len(library_adds)} from library"
+        if has_append:
+            display_name = f"+{len(saved)} slide(s) to existing"
+        elif name:
+            display_name = name
+        else:
+            display_name = f"+{len(library_adds)} from library"
         ts = now()
         with db_lock, db() as c:
             if not c.execute("SELECT 1 FROM agents WHERE machine_id=?", (machine_id,)).fetchone():
                 c.execute("INSERT INTO agents(machine_id, name, last_seen, presentations) VALUES(?,?,0,'[]')",
                           (machine_id, "(offline)"))
             c.execute("INSERT INTO jobs(job_id, machine_id, name, status, folder, files_json, "
-                      "library_adds_json, playlist_uuid, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      "library_adds_json, playlist_uuid, add_to_pres_uuid, created_at, updated_at) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (jid, machine_id, display_name, "queued", jdir,
-                       json.dumps(saved), json.dumps(library_adds), playlist_uuid, ts, ts))
+                       json.dumps(saved), json.dumps(library_adds), playlist_uuid,
+                       add_to_pres_uuid, ts, ts))
             c.commit()
         log.info(f"  -> Job {jid[:8]} queued for {machine_id}: '{display_name}' "
                  f"({len(saved)} files, {len(library_adds)} library_adds, "
-                 f"playlist={playlist_uuid[:8] if playlist_uuid else 'default'})")
+                 f"playlist={playlist_uuid[:8] if playlist_uuid else 'default'}, "
+                 f"append_to={add_to_pres_uuid[:8] if add_to_pres_uuid else 'none'})")
         # Discord: upload received
         try:
             with db_lock, db() as c:
