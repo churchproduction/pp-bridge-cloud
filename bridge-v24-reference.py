@@ -736,8 +736,28 @@ def add_slides_to_pres(pres_uuid, folder):
     for cu in new_cue_uuids:
         target_group.cue_identifiers.add().string = cu
 
-    # Save
-    with open(path, "wb") as f: f.write(pres.SerializeToString())
+    # Save — rename-then-write trick to force ProPresenter to reload.
+    # PP doesn't notice in-place file overwrites (the inode is the same and PP
+    # caches the parsed contents indefinitely). But PP DOES rescan when a file
+    # at a known path "appears" — so we rename the existing .pro out of the way,
+    # write the new contents at the original path (new inode), then delete the
+    # old one. This makes PP treat it as a fresh file and reload from disk.
+    # Confirmed working 2026-05-11 via the BRIDGE_TEST_* probe.
+    bak = path + ".bridgetmp"
+    serialized = pres.SerializeToString()
+    try:
+        if os.path.exists(bak):
+            os.remove(bak)
+        os.rename(path, bak)
+        with open(path, "wb") as f: f.write(serialized)
+        os.remove(bak)
+    except Exception as e:
+        # Fall back to plain in-place write so we never lose the file
+        print(f"  rename-rewrite failed ({e}), falling back to in-place write")
+        with open(path, "wb") as f: f.write(serialized)
+        # Restore from .bak if the rewrite path errored mid-way
+        if os.path.exists(bak) and not os.path.exists(path):
+            os.rename(bak, path)
     print(f"Saved {path} with {len(new_cue_uuids)} new slide(s)")
 
     # Nudge ProPresenter to re-read the file from disk. PP caches presentations
