@@ -339,6 +339,34 @@ threading.Thread(target=control_cleanup_loop, daemon=True).start()
 # Agent online/offline watcher — posts to Discord #remote when an agent's
 # status changes. Runs every 30 seconds.
 _agent_watch_state = {}
+
+# Tracks which machine_ids are currently mid-restart_propresenter. While a
+# Mac is in this dict, all other control commands to it are rejected with
+# 503 so they never get dispatched to a bridge.py that can't talk to PP.
+# Value is the unix timestamp when the restart was initiated. Entries are
+# auto-cleared after RESTART_LOCK_SECONDS even if the restart command never
+# returns a result (safety fallback).
+_restart_in_progress = {}
+_restart_lock = threading.Lock()
+RESTART_LOCK_SECONDS = 45
+
+def is_restart_in_progress(mid):
+    with _restart_lock:
+        ts = _restart_in_progress.get(mid)
+        if not ts:
+            return False
+        if time.time() - ts > RESTART_LOCK_SECONDS:
+            _restart_in_progress.pop(mid, None)
+            return False
+        return True
+
+def mark_restart_in_progress(mid):
+    with _restart_lock:
+        _restart_in_progress[mid] = time.time()
+
+def clear_restart_in_progress(mid):
+    with _restart_lock:
+        _restart_in_progress.pop(mid, None)
 def agent_watch_loop():
     global _agent_watch_state
     # Seed initial state silently so we don't spam at startup
@@ -715,6 +743,16 @@ class H(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": "unknown machine_id"})
         if not is_online_row(ag):
             return self._send_json(503, {"error": "machine offline"})
+        # Block other commands while restart_propresenter is mid-flight.
+        # During the ~25s restart, ProPresenter's API is unreachable, so
+        # forwarding commands to bridge.py would produce ugly errors. We
+        # silently drop them server-side with a specific 503 the frontend
+        # can recognize and suppress.
+        if cmd != "restart_propresenter" and is_restart_in_progress(mid):
+            return self._send_json(503, {"error": "restart_in_progress",
+                "message": "ProPresenter is restarting on this machine. Try again in ~25s."})
+        if cmd == "restart_propresenter":
+            mark_restart_in_progress(mid)
         jid = uuid.uuid4().hex
         ts = now()
         with db_lock, db() as c:
@@ -768,6 +806,8 @@ class H(BaseHTTPRequestHandler):
                 except Exception as e:
                     log.warning(f"Discord remote notification failed: {e}")
                 log.info(f"CTRL {jid[:8]} RETURN ok={final_ok} after {time.time()-ts:.2f}s")
+                if cmd == "restart_propresenter":
+                    clear_restart_in_progress(mid)
                 return self._send_json(200, {
                     "job_id": jid,
                     "ok": final_ok,
