@@ -283,6 +283,7 @@ CONTROL_COMMANDS = {
     "trigger_next":          lambda a: ["trigger_next"],
     "trigger_previous":      lambda a: ["trigger_previous"],
     "clear_slide":           lambda a: ["clear_slide"],
+    "restart_propresenter":  lambda a: ["restart_propresenter"],
     "get_thumbnails_bulk":   lambda a: ["get_thumbnails_bulk", a[0]],
     "get_active_thumbnail":  lambda a: ["get_active_thumbnail"],
     "list_playlists":        lambda a: ["list_playlists"],
@@ -300,9 +301,12 @@ def run_control_job(cmd, args):
     except (IndexError, TypeError) as e:
         return False, {"ok": False, "error": f"bad args: {e}"}
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=CONTROL_BRIDGE_TIMEOUT)
+        # restart_propresenter quits the app and waits for the API to come back online —
+        # can take 30s+. Other commands get the normal short timeout.
+        timeout = 60 if cmd == "restart_propresenter" else CONTROL_BRIDGE_TIMEOUT
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return False, {"ok": False, "error": f"bridge.py timeout ({CONTROL_BRIDGE_TIMEOUT}s)"}
+        return False, {"ok": False, "error": f"bridge.py timeout"}
     if r.returncode != 0:
         # bridge.py emits JSON to stdout even on errors for control commands;
         # try to parse it before falling back to stderr text.
