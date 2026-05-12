@@ -16,7 +16,7 @@ MAX_UPLOAD = 200 * 1024 * 1024
 
 # Control-job tuning
 AGENT_LONGPOLL_SECONDS = 25     # how long the agent's GET hangs waiting for a control job
-CONTROL_RESULT_TIMEOUT = 60     # how long the frontend POST waits for the agent to finish
+CONTROL_RESULT_TIMEOUT = 90     # how long the frontend POST waits for the agent to finish
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -679,7 +679,7 @@ class H(BaseHTTPRequestHandler):
         "trigger_next":         {"args": 0, "max_wait": 6},
         "trigger_previous":     {"args": 0, "max_wait": 6},
         "clear_slide":          {"args": 0, "max_wait": 6},
-        "restart_propresenter": {"args": 0, "max_wait": 55},
+        "restart_propresenter": {"args": 0, "max_wait": 85},
         # Cross-Mac sync (Production GUI)
         "read_pres_for_sync":   {"args": 1, "max_wait": 20},
         "sync_pres_to_playlist":{"args": 3, "max_wait": 25},
