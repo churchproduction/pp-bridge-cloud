@@ -489,26 +489,32 @@ def restart_propresenter():
     """Quit ProPresenter and reopen it. Used after add_slides_to_pres so the
     user can see appended slides without manual intervention. ProPresenter
     caches presentations in memory and doesn't re-read .pro files on disk
-    changes, so a relaunch is the only reliable way to refresh."""
+    changes, so a relaunch is the only reliable way to refresh.
+
+    Uses pkill to bypass PP's 'Are you sure?' confirmation dialog that
+    blocks AppleScript-based graceful quit."""
     try:
-        # Step 1: Quit PP via AppleScript (graceful — saves state)
-        subprocess.run(
-            ["osascript", "-e", 'tell application "ProPresenter" to quit'],
-            check=False, timeout=10
-        )
-        # Step 2: Wait for it to actually close
+        # Step 1: Force quit PP (TERM = polite SIGTERM, gives ~3s to clean up)
+        subprocess.run(["pkill", "-TERM", "-x", "ProPresenter"],
+                       check=False, timeout=5)
+        # Step 2: Wait for PP to exit (poll up to 10s)
+        gone = False
         for _ in range(20):
             time.sleep(0.5)
             r = subprocess.run(["pgrep", "-x", "ProPresenter"],
                                capture_output=True, text=True, timeout=3)
             if not r.stdout.strip():
+                gone = True
                 break
-        # Step 3: Reopen it
-        subprocess.run(
-            ["open", "-a", "ProPresenter"],
-            check=False, timeout=10
-        )
-        # Step 4: Wait for API to come back online (PP takes a few seconds to boot)
+        # Step 3: If it didn't exit politely, KILL it
+        if not gone:
+            subprocess.run(["pkill", "-KILL", "-x", "ProPresenter"],
+                           check=False, timeout=5)
+            time.sleep(1)
+        # Step 4: Reopen it
+        subprocess.run(["open", "-a", "ProPresenter"],
+                       check=False, timeout=10)
+        # Step 5: Wait for API to come back online (PP takes a few seconds to boot)
         ready = False
         for _ in range(30):
             time.sleep(1)
