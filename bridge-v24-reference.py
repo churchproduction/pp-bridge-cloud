@@ -1,5 +1,5 @@
 """ProPresenter Bridge — generator + remote-control commands."""
-import os, sys, json, uuid, shutil, glob, time, re, unicodedata
+import os, sys, json, uuid, shutil, glob, time, re, unicodedata, subprocess
 import urllib.request, urllib.parse
 import importlib.util
 
@@ -484,6 +484,43 @@ def trigger_previous():
 def clear_slide():
     api("GET", "/clear/layer/slide")
     _emit({"ok": True, "action": "clear"})
+
+def restart_propresenter():
+    """Quit ProPresenter and reopen it. Used after add_slides_to_pres so the
+    user can see appended slides without manual intervention. ProPresenter
+    caches presentations in memory and doesn't re-read .pro files on disk
+    changes, so a relaunch is the only reliable way to refresh."""
+    try:
+        # Step 1: Quit PP via AppleScript (graceful — saves state)
+        subprocess.run(
+            ["osascript", "-e", 'tell application "ProPresenter" to quit'],
+            check=False, timeout=10
+        )
+        # Step 2: Wait for it to actually close
+        for _ in range(20):
+            time.sleep(0.5)
+            r = subprocess.run(["pgrep", "-x", "ProPresenter"],
+                               capture_output=True, text=True, timeout=3)
+            if not r.stdout.strip():
+                break
+        # Step 3: Reopen it
+        subprocess.run(
+            ["open", "-a", "ProPresenter"],
+            check=False, timeout=10
+        )
+        # Step 4: Wait for API to come back online (PP takes a few seconds to boot)
+        ready = False
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                api("GET", "/version")
+                ready = True
+                break
+            except Exception:
+                pass
+        _emit({"ok": True, "action": "restart_propresenter", "ready": ready})
+    except Exception as e:
+        _emit({"ok": False, "error": f"restart failed: {e}"})
 
 def delete_from_ministries(item_uuid):
     """LEGACY: remove a single playlist item from Ministries by item_uuid.
@@ -1230,6 +1267,8 @@ if __name__ == "__main__":
         trigger_previous()
     elif cmd == "clear_slide":
         clear_slide()
+    elif cmd == "restart_propresenter":
+        restart_propresenter()
     elif cmd == "delete_from_min":
         if len(sys.argv) < 3: print("Usage: bridge.py delete_from_min <item_uuid>"); sys.exit(1)
         delete_from_ministries(sys.argv[2])
