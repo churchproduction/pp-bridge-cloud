@@ -511,19 +511,36 @@ def restart_propresenter():
             subprocess.run(["pkill", "-KILL", "-x", "ProPresenter"],
                            check=False, timeout=5)
             time.sleep(1)
-        # Step 4: Reopen it
-        subprocess.run(["open", "-a", "ProPresenter"],
-                       check=False, timeout=10)
-        # Step 5: Wait for API to come back online (PP takes a few seconds to boot)
+        # Step 4: Reopen it. Use the explicit Applications path so we don't
+        # accidentally launch a stray copy that Launch Services indexed
+        # (e.g., one sitting in ~/Downloads from a recent install).
+        PP_APP = "/Applications/ProPresenter.app"
+        if os.path.isdir(PP_APP):
+            subprocess.run(["open", "-a", PP_APP], check=False, timeout=10)
+        else:
+            # Fall back to name-based open if PP isn't where we expect.
+            subprocess.run(["open", "-a", "ProPresenter"], check=False, timeout=10)
+        # Step 5: Wait for API to come back online. /version responds early
+        # in PP's startup but doesn't mean the library/playlists are loaded.
+        # We poll /v1/playlists specifically since that's what the Remote
+        # will hit immediately after the restart — and require TWO consecutive
+        # successes a second apart so we don't catch a brief "ready then 404"
+        # flicker during library indexing.
         ready = False
-        for _ in range(30):
+        consecutive_ok = 0
+        for _ in range(45):
             time.sleep(1)
             try:
-                api("GET", "/version")
-                ready = True
-                break
+                r = api("GET", "/playlists")
+                if isinstance(r, list):
+                    consecutive_ok += 1
+                    if consecutive_ok >= 2:
+                        ready = True
+                        break
+                else:
+                    consecutive_ok = 0
             except Exception:
-                pass
+                consecutive_ok = 0
         _emit({"ok": True, "action": "restart_propresenter", "ready": ready})
     except Exception as e:
         _emit({"ok": False, "error": f"restart failed: {e}"})
