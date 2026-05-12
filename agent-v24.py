@@ -303,7 +303,7 @@ def run_control_job(cmd, args):
     try:
         # restart_propresenter quits the app and waits for the API to come back online —
         # can take 30s+. Other commands get the normal short timeout.
-        timeout = 60 if cmd == "restart_propresenter" else CONTROL_BRIDGE_TIMEOUT
+        timeout = 90 if cmd == "restart_propresenter" else CONTROL_BRIDGE_TIMEOUT
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, {"ok": False, "error": f"bridge.py timeout"}
