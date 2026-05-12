@@ -336,6 +336,27 @@ def control_cleanup_loop():
 
 threading.Thread(target=control_cleanup_loop, daemon=True).start()
 
+# Orphan upload cleanup — in case a job dies before the agent reports
+# completion (network failure, agent crash, etc.), the per-job folder under
+# UPLOAD_DIR can be left behind forever. Sweep folders older than 1 hour.
+# This is a safety net — normal job completion already cleans up via the
+# /api/agent/result handler.
+def upload_cleanup_loop():
+    while True:
+        try:
+            if os.path.isdir(UPLOAD_DIR):
+                cutoff = time.time() - 3600  # 1 hour
+                for entry in os.listdir(UPLOAD_DIR):
+                    full = os.path.join(UPLOAD_DIR, entry)
+                    if os.path.isdir(full) and os.path.getmtime(full) < cutoff:
+                        shutil.rmtree(full, ignore_errors=True)
+                        log.info(f"Orphan upload folder cleaned: {entry[:8]}")
+        except Exception as e:
+            log.warning(f"upload cleanup error: {e}")
+        time.sleep(600)  # every 10 min
+
+threading.Thread(target=upload_cleanup_loop, daemon=True).start()
+
 # Agent online/offline watcher — posts to Discord #remote when an agent's
 # status changes. Runs every 30 seconds.
 _agent_watch_state = {}
@@ -348,7 +369,7 @@ _agent_watch_state = {}
 # returns a result (safety fallback).
 _restart_in_progress = {}
 _restart_lock = threading.Lock()
-RESTART_LOCK_SECONDS = 45
+RESTART_LOCK_SECONDS = 15
 
 def is_restart_in_progress(mid):
     with _restart_lock:
@@ -581,11 +602,21 @@ class H(BaseHTTPRequestHandler):
             fname = unquote(fname)
             path = os.path.join(UPLOAD_DIR, jid, fname)
             if not os.path.exists(path): return self._send_json(404, {"error": "not found"})
-            with open(path, "rb") as f: data = f.read()
+            # Stream the file in chunks instead of f.read() — large videos
+            # would otherwise load entirely into RAM and push the container
+            # over its 512 MB limit during agent downloads.
+            file_size = os.path.getsize(path)
             self.send_response(200); self._cors()
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers(); self.wfile.write(data); return
+            self.send_header("Content-Length", str(file_size))
+            self.end_headers()
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)  # 64 KB chunks
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            return
         return self._send_json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -620,6 +651,17 @@ class H(BaseHTTPRequestHandler):
                                 "WHERE j.job_id=?", (jid,)).fetchone()
                 c.commit()
             log.info(f"  -> Job {jid[:8]} {'done' if ok else 'failed'}: {msg}")
+            # Clean up the upload folder so files don't accumulate on disk and
+            # push the Render container over its 512 MB memory limit. Whether
+            # the job succeeded or failed, the agent already has whatever it
+            # needed (or couldn't get to it) — we don't need the files anymore.
+            try:
+                job_dir = os.path.join(UPLOAD_DIR, jid)
+                if os.path.isdir(job_dir):
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    log.info(f"  -> Cleaned up upload folder for {jid[:8]}")
+            except Exception as e:
+                log.warning(f"Upload cleanup failed for {jid[:8]}: {e}")
             try:
                 pres_name = row["name"] if row else "?"
                 mac_label = (row["mac_name"] if row and row["mac_name"] else (row["machine_id"] if row else "?"))
