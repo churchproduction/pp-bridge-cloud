@@ -753,6 +753,11 @@ class H(BaseHTTPRequestHandler):
         # Cross-Mac sync (Production GUI)
         "read_pres_for_sync":   {"args": 1, "max_wait": 20},
         "sync_pres_to_playlist":{"args": 3, "max_wait": 25},
+        # Audio Mac — projector + screen control
+        "projector_on":         {"args": 1, "max_wait": 10},
+        "projector_off":        {"args": 1, "max_wait": 10},
+        "screen_up":            {"args": 1, "max_wait": 8},
+        "screen_down":          {"args": 1, "max_wait": 8},
     }
 
     def _control_submit(self):
@@ -1015,6 +1020,8 @@ class H(BaseHTTPRequestHandler):
                     return {"ok": False, "error": "malformed result"}
             time.sleep(0.15)
         return {"ok": False, "error": f"timeout after {max_wait}s"}
+
+    def _upload_form(self):
         agents_json = "[]"
         try:
             with db_lock, db() as c:
