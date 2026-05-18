@@ -758,6 +758,10 @@ class H(BaseHTTPRequestHandler):
         "projector_off":        {"args": 1, "max_wait": 10},
         "screen_up":            {"args": 1, "max_wait": 8},
         "screen_down":          {"args": 1, "max_wait": 8},
+        # Audio Mac — AHM mixer control
+        "ahm_fader":            {"args": 2, "max_wait": 5},
+        "ahm_use_app":          {"args": 0, "max_wait": 5},
+        "ahm_use_board":        {"args": 0, "max_wait": 5},
     }
 
     def _control_submit(self):
