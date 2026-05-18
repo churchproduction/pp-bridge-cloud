@@ -762,6 +762,9 @@ class H(BaseHTTPRequestHandler):
         "ahm_fader":            {"args": 2, "max_wait": 5},
         "ahm_use_app":          {"args": 0, "max_wait": 5},
         "ahm_use_board":        {"args": 0, "max_wait": 5},
+        # Mac-mini-production — Building A TV control
+        "tv_on":                {"args": 0, "max_wait": 35},
+        "tv_off":               {"args": 0, "max_wait": 15},
     }
 
     def _control_submit(self):
