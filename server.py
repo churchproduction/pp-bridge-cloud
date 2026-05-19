@@ -478,6 +478,52 @@ class H(BaseHTTPRequestHandler):
             return self._send_text(200, "PP Bridge cloud — alive")
         if u.path == "/upload":
             return self._upload_form()
+        # ─── DEBUG: LibreOffice install check ──────────────────────────
+        # Temporary diagnostic endpoint. Returns JSON describing whether
+        # libreoffice is available to the running container. Remove after
+        # diagnosing the PPTX conversion problem.
+        if u.path == "/api/debug-libreoffice":
+            info = {}
+            info["shutil_which_libreoffice"] = shutil.which("libreoffice")
+            info["shutil_which_soffice"] = shutil.which("soffice")
+            info["shutil_which_pdftoppm"] = shutil.which("pdftoppm")
+            info["path_env"] = os.environ.get("PATH", "")
+            try:
+                r = subprocess.run(["which", "libreoffice"], capture_output=True, text=True, timeout=5)
+                info["which_libreoffice_stdout"] = r.stdout.strip()
+                info["which_libreoffice_stderr"] = r.stderr.strip()
+                info["which_libreoffice_rc"] = r.returncode
+            except Exception as e:
+                info["which_libreoffice_error"] = str(e)
+            try:
+                r = subprocess.run(["ls", "/usr/bin/"], capture_output=True, text=True, timeout=5)
+                info["libre_in_usr_bin"] = sorted(
+                    [l for l in r.stdout.split() if "libre" in l.lower() or "soffice" in l.lower()]
+                )
+            except Exception as e:
+                info["libre_in_usr_bin_error"] = str(e)
+            try:
+                r = subprocess.run(["ls", "/usr/lib/libreoffice/program/"],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    info["usr_lib_libreoffice_program"] = sorted(r.stdout.split())[:30]
+                else:
+                    info["usr_lib_libreoffice_program"] = f"missing: {r.stderr[:200]}"
+            except Exception as e:
+                info["usr_lib_libreoffice_program_error"] = str(e)
+            try:
+                r = subprocess.run(["dpkg", "-l", "libreoffice-impress"],
+                                   capture_output=True, text=True, timeout=5)
+                info["dpkg_libreoffice_impress"] = (r.stdout + r.stderr).strip()[-500:]
+            except Exception as e:
+                info["dpkg_error"] = str(e)
+            try:
+                r = subprocess.run(["cat", "/etc/os-release"],
+                                   capture_output=True, text=True, timeout=5)
+                info["os_release"] = r.stdout.strip()
+            except Exception as e:
+                info["os_release_error"] = str(e)
+            return self._send_json(200, info)
         # ─── Emergency kill switch (admin) ─────────────────────────────
         # GET-based so a phone bookmark or Discord-pinned link is one tap.
         # Token comes from query string, compared to KILL_SWITCH_TOKEN env var.
