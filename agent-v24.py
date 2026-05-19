@@ -18,7 +18,7 @@ except ImportError:
     sys.exit(2)
 
 # ── Config ─────────────────────────────────────────────────────────
-CLOUD_URL    = "https://pp-bridge-cloud-v2.onrender.com"
+CLOUD_URL    = "https://pp-bridge-cloud.onrender.com"
 
 # ProPresenter API (uniform across all Macs since v21 migration)
 PP_API_PORT = 1025
